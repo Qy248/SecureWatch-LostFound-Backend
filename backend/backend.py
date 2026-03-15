@@ -38,6 +38,7 @@ from pydantic import BaseModel
 ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
 try:
     lf = None
+    LiveHub = None
     if ENABLE_HEAVY_PIPELINE:
         import lostandfound as lf
         from lostfound_backend.backend.live_hub import LiveHub
