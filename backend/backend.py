@@ -119,7 +119,7 @@ _analyze_queued: Set[str] = set()
 OFFLINE_LOCKS = defaultdict(threading.Lock)
 
 # Live components
-hub = LiveHub()
+hub = LiveHub() if ENABLE_HEAVY_PIPELINE and LiveHub is not None else None
 pipelines_live: Dict[str, Any] = {}
 pipelines_settings: Dict[str, Any] = {}
 pipelines: Dict[str, Any] = {}
@@ -2082,7 +2082,8 @@ def live_pump() -> None:
                             v["dets"] = []
                             v["detections"] = []
                             v["detection_enabled"] = False
-
+                        if hub is None:
+                             return {"ok": False, "message": "Live hub disabled in cloud mode"}
                         hub.update(cam_id, views_payload, lost_items=[])
                     except Exception as e:
                         _system(f"Error processing disabled detection for {cam_id}: {e}")
@@ -2223,6 +2224,9 @@ def live_pump() -> None:
                 # if camera off, no lost items
                 if not cam_on:
                     lost_items = []
+                
+                if hub is None:
+                    return {"ok": False, "message": "Live hub disabled in cloud mode"}
 
                 # Update hub
                 hub.update(cam_id, views_payload, lost_items=lost_items)
