@@ -35,27 +35,18 @@ from fastapi import Query
 from pydantic import BaseModel
 
 # Local imports
-# ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
-# try:
-#     lf = None
-#     LiveHub = None
-#     if ENABLE_HEAVY_PIPELINE:
-#         import lostandfound as lf
-#         from backend.live_hub import LiveHub
-# except ModuleNotFoundError:
-#     import lostandfound as lf
-#     from backend.live_hub import LiveHub
-# import re, datetime
 ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
-
-lf = None
-LiveHub = None
-
-if ENABLE_HEAVY_PIPELINE:
+try:
+    lf = None
+    LiveHub = None
+    if ENABLE_HEAVY_PIPELINE:
+        import lostandfound as lf
+        from backend.live_hub import LiveHub
+except ModuleNotFoundError:
     import lostandfound as lf
     from backend.live_hub import LiveHub
-
 import re, datetime
+
 
 # ============================================================
 # Configuration and Constants
