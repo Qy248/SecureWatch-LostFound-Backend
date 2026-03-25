@@ -28,11 +28,9 @@ import cv2
 import numpy as np
 import lostandfound as lf
 
-FISHEYE_CFG_STORE = os.path.join(
-    "backend",
-    "outputs",
-    "lost_and_found",
-    "fisheye_view_configs.json"
+FISHEYE_CFG_STORE = (
+    r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch"
+    r"\lostfound_backend\backend\outputs\lost_and_found\fisheye_view_configs.json"
 )
 
 
@@ -347,6 +345,7 @@ def _write_roi_config_safe(config_path: str, bounding_polygons: list, fisheye_po
     os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
+
 
 
 # ---------------------------------------------------------
@@ -1624,6 +1623,30 @@ class VideoPipeline:
         except Exception:
             pass
         return None
+    
+    def _encode_jpg(self, img_bgr: np.ndarray | None, quality: int = 70) -> bytes | None:
+        if img_bgr is None or not isinstance(img_bgr, np.ndarray):
+            return None
+        try:
+            ok, buf = cv2.imencode(
+                ".jpg",
+                img_bgr,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+            )
+            return buf.tobytes() if ok else None
+        except Exception:
+            return None
+
+    def _get_cached_views_for_group(self, gi: int) -> list:
+        try:
+            with self._last_bundle_lock:
+                ts_views = self._last_bundle_by_gi.get(int(gi))
+            if not ts_views:
+                return []
+            _, views = ts_views
+            return views or []
+        except Exception:
+            return []
 
     def _start_detection_threads(self):
         self.det_stop_event = threading.Event()
@@ -2294,6 +2317,24 @@ class VideoPipeline:
             return cv2.resize(img_bgr, (640, 480), interpolation=cv2.INTER_AREA)
         except Exception:
             return img_bgr
+        
+    def pull_live_tile_jpg(self, group: str = "0") -> bytes | None:
+        """
+        Live-view tile output.
+        - fisheye: A/B -> 2x2 grid with overlay
+        - normal: single view with overlay
+        """
+        try:
+            g = (group or "0").upper().strip()
+
+            if self.is_fisheye:
+                if g not in ("A", "B"):
+                    g = "A"
+                return self.pull_group_grid_jpg(g, draw_roi_overlay=True)
+
+            return self.pull_single_view_jpg(0, draw_roi_overlay=True)
+        except Exception:
+            return None
 
     def pull_single_view_jpg(self, view_idx_global: int, draw_roi_overlay: bool | None = None) -> bytes | None:
         self._refresh_runtime_configs_if_needed()
@@ -2444,101 +2485,100 @@ class VideoPipeline:
 
     def pull_single_view_jpg_clean(self, view_idx_global: int) -> bytes | None:
         """
-        True dashboard-safe single-view JPG.
+        Dashboard-safe single-view JPG.
+        Priority:
+          1) fisheye/raw-frame rebuild
+          2) cached latest processed view fallback
         Never draws ROI overlay.
-        For fisheye: uses latest RAW frame so ROI/detection state cannot leak in.
-        For normal: uses latest cached frame image directly (no ROI drawing).
         """
         self._refresh_runtime_configs_if_needed()
 
         try:
             vi = int(view_idx_global)
         except Exception:
-            return None
+            vi = 0
 
-        # -----------------------------
+        # -------------------------------------------------
         # FISHEYE CLEAN PATH
-        # -----------------------------
+        # -------------------------------------------------
         if self.is_fisheye and self.preprocessor is not None:
             gi = 0 if vi < 4 else 1
             local = vi if gi == 0 else (vi - 4)
             local = max(0, min(3, local))
 
+            # 1) Try latest raw frame rebuild first
             raw_fr = self._get_latest_raw_frame_copy()
-            if raw_fr is None:
-                return None
-
-            try:
-                allowed_names = self._fisheye_expected_names(gi)
-
+            if raw_fr is not None:
                 try:
-                    views = self.preprocessor.get_views(raw_fr, allowed_names=allowed_names)
-                except TypeError:
-                    views = self.preprocessor.get_views(raw_fr)
+                    allowed_names = self._fisheye_expected_names(gi)
 
-                if not views:
-                    return None
+                    try:
+                        views = self.preprocessor.get_views(raw_fr, allowed_names=allowed_names)
+                    except TypeError:
+                        views = self.preprocessor.get_views(raw_fr)
 
-                wanted_name = allowed_names[local] if local < len(allowed_names) else None
-                chosen = None
+                    if views:
+                        wanted_name = allowed_names[local] if local < len(allowed_names) else None
+                        chosen = None
 
-                # Prefer exact runtime view name match
-                if wanted_name:
-                    for v in views:
-                        if not isinstance(v, dict):
-                            continue
-                        name = str(v.get("name") or "").strip()
-                        if name == wanted_name:
-                            chosen = v
-                            break
+                        if wanted_name:
+                            for v in views:
+                                if not isinstance(v, dict):
+                                    continue
+                                name = str(v.get("name") or "").strip()
+                                if name == wanted_name:
+                                    chosen = v
+                                    break
 
-                # Fallback by local position inside current group
-                if chosen is None:
-                    filtered = []
-                    wanted = set(allowed_names)
-                    for v in views:
-                        if not isinstance(v, dict):
-                            continue
-                        name = str(v.get("name") or "").strip()
-                        if name and name in wanted:
-                            filtered.append(v)
+                        if chosen is None:
+                            filtered = []
+                            wanted = set(allowed_names)
+                            for v in views:
+                                if not isinstance(v, dict):
+                                    continue
+                                name = str(v.get("name") or "").strip()
+                                if name and name in wanted:
+                                    filtered.append(v)
 
-                    filtered = sorted(filtered, key=lambda x: int(x.get("view_id", 0) or 0))
-                    if 0 <= local < len(filtered):
-                        chosen = filtered[local]
+                            filtered = sorted(filtered, key=lambda x: int(x.get("view_id", 0) or 0))
+                            if 0 <= local < len(filtered):
+                                chosen = filtered[local]
 
-                if not chosen:
-                    return None
+                        if chosen is not None:
+                            img = chosen.get("image")
+                            if isinstance(img, np.ndarray):
+                                return self._encode_jpg(img.copy(), quality=75)
+                except Exception:
+                    pass
 
-                img = chosen.get("image")
-                if not isinstance(img, np.ndarray):
-                    return None
+            # 2) Fallback to cached processed views
+            cached_views = self._get_cached_views_for_group(gi)
+            if cached_views:
+                wanted_ids = [vi, vi - 4] if gi == 1 else [vi]
+                for v in cached_views:
+                    if not isinstance(v, dict):
+                        continue
+                    try:
+                        vid = int(v.get("view_id", -1))
+                    except Exception:
+                        continue
+                    if vid in wanted_ids:
+                        raw = v.get("raw_view")
+                        img = raw if isinstance(raw, np.ndarray) else v.get("image")
+                        if isinstance(img, np.ndarray):
+                            return self._encode_jpg(img.copy(), quality=75)
 
-                img2 = img.copy()
-
-                ok, buf = cv2.imencode(".jpg", img2, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                return buf.tobytes() if ok else None
-
-            except Exception:
-                return None
-
-        # -----------------------------
-        # NORMAL CLEAN PATH
-        # -----------------------------
-        gi = 0
-
-        with self._last_bundle_lock:
-            ts_views = self._last_bundle_by_gi.get(int(gi))
-
-        if not ts_views:
             return None
 
-        _, views = ts_views
-        if not views:
+        # -------------------------------------------------
+        # NORMAL CLEAN PATH
+        # -------------------------------------------------
+        cached_views = self._get_cached_views_for_group(0)
+        if not cached_views:
             return None
 
         chosen = None
-        for v in views:
+        for v in cached_views:
             if not isinstance(v, dict):
                 continue
             try:
@@ -2549,96 +2589,131 @@ class VideoPipeline:
                 chosen = v
                 break
 
+        if chosen is None and cached_views:
+            chosen = cached_views[0]
+
         if not chosen:
             return None
 
-        img = chosen.get("image")
+        raw = chosen.get("raw_view")
+        img = raw if isinstance(raw, np.ndarray) else chosen.get("image")
         if not isinstance(img, np.ndarray):
             return None
 
-        try:
-            ok, buf = cv2.imencode(".jpg", img.copy(), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            return buf.tobytes() if ok else None
-        except Exception:
-            return None
+        return self._encode_jpg(img.copy(), quality=75)
 
     def pull_group_grid_jpg_clean(self, group: str) -> bytes | None:
         """
-        True dashboard-safe fisheye 2x2 grid JPG.
-        Uses latest RAW frame so ROI from processed cache cannot leak in.
-        Preserves aspect ratio for each subview.
+        Dashboard-safe fisheye 2x2 grid JPG.
+        Priority:
+          1) rebuild from latest raw frame
+          2) fallback to cached processed views
+        Never draws ROI overlay.
         """
         self._refresh_runtime_configs_if_needed()
 
         group = (group or "A").upper().strip()
         gi = 0 if group == "A" else 1
 
-        if not self.is_fisheye or self.preprocessor is None:
+        if not self.is_fisheye:
+            # normal cameras do not have A/B group grid
+            return self.pull_single_view_jpg_clean(0)
+
+        # -------------------------------------------------
+        # 1) Try latest raw frame rebuild
+        # -------------------------------------------------
+        if self.preprocessor is not None:
+            raw_fr = self._get_latest_raw_frame_copy()
+            if raw_fr is not None:
+                try:
+                    allowed_names = self._fisheye_expected_names(gi)
+
+                    try:
+                        views = self.preprocessor.get_views(raw_fr, allowed_names=allowed_names)
+                    except TypeError:
+                        views = self.preprocessor.get_views(raw_fr)
+
+                    if views:
+                        wanted = set(allowed_names)
+                        prepared = []
+
+                        for v in views:
+                            if not isinstance(v, dict):
+                                continue
+
+                            img = v.get("image")
+                            if not isinstance(img, np.ndarray):
+                                continue
+
+                            view_name = str(v.get("name") or "").strip()
+                            if view_name and view_name not in wanted:
+                                continue
+
+                            prepared.append({
+                                "view_id": int(v.get("view_id", 0) or 0),
+                                "name": view_name or f"view_{int(v.get('view_id', 0) or 0)}",
+                                "image": img.copy(),
+                            })
+
+                        if prepared:
+                            grid = self._build_fisheye_grid_preserve_aspect(prepared)
+                            if isinstance(grid, np.ndarray):
+                                return self._encode_jpg(grid, quality=70)
+                except Exception:
+                    pass
+
+        # -------------------------------------------------
+        # 2) Fallback to cached processed views
+        # -------------------------------------------------
+        cached_views = self._get_cached_views_for_group(gi)
+        if not cached_views:
             return None
 
-        raw_fr = self._get_latest_raw_frame_copy()
-        if raw_fr is None:
+        prepared = []
+        for v in sorted(cached_views, key=lambda x: x.get("view_id", 0)):
+            if not isinstance(v, dict):
+                continue
+
+            raw = v.get("raw_view")
+            img = raw if isinstance(raw, np.ndarray) else v.get("image")
+            if not isinstance(img, np.ndarray):
+                continue
+
+            prepared.append({
+                "view_id": int(v.get("view_id", 0) or 0),
+                "name": str(v.get("name") or f"view_{int(v.get('view_id', 0) or 0)}"),
+                "image": img.copy(),
+            })
+
+        if not prepared:
             return None
 
-        try:
-            allowed_names = self._fisheye_expected_names(gi)
-
-            try:
-                views = self.preprocessor.get_views(raw_fr, allowed_names=allowed_names)
-            except TypeError:
-                views = self.preprocessor.get_views(raw_fr)
-
-            if not views:
-                return None
-
-            wanted = set(allowed_names)
-            prepared = []
-
-            for v in views:
-                if not isinstance(v, dict):
-                    continue
-
-                img = v.get("image")
-                if not isinstance(img, np.ndarray):
-                    continue
-
-                view_name = str(v.get("name") or "").strip()
-                if view_name and view_name not in wanted:
-                    continue
-
-                prepared.append({
-                    "view_id": int(v.get("view_id", 0) or 0),
-                    "name": view_name or f"view_{int(v.get('view_id', 0) or 0)}",
-                    "image": img.copy(),
-                })
-
-            if not prepared:
-                return None
-
-            grid = self._build_fisheye_grid_preserve_aspect(prepared)
-            if grid is None:
-                return None
-
-            ok, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            return buf.tobytes() if ok else None
-
-        except Exception:
+        grid = self._build_fisheye_grid_preserve_aspect(prepared)
+        if not isinstance(grid, np.ndarray):
             return None
+
+        return self._encode_jpg(grid, quality=70)
 
     def pull_dashboard_jpg(self, target: str) -> bytes | None:
         """
-        Unified dashboard-safe output:
-        - target 'A'/'B' => fisheye group grid
-        - target '0','1',... => single view
-        Never draws ROI overlay.
+        Unified dashboard-safe output.
+        - fisheye:
+            A/B -> 2x2 group grid
+            0   -> first single view
+        - normal:
+            always single clean view
         """
         try:
-            t = str(target).upper().strip()
-            if t in ("A", "B"):
-                return self.pull_group_grid_jpg_clean(t)
+            t = str(target or "A").upper().strip()
 
-            view_idx = int(t)
-            return self.pull_single_view_jpg_clean(view_idx)
+            if self.is_fisheye:
+                if t in ("A", "B"):
+                    return self.pull_group_grid_jpg_clean(t)
+                return self.pull_single_view_jpg_clean(0)
+
+            # normal camera
+            return self.pull_single_view_jpg_clean(0)
+
         except Exception:
             return None
 
@@ -2701,7 +2776,7 @@ class VideoPipeline:
 # ---------------------------------------------------------
 # ONE DB file for all camera ROI configs
 # ---------------------------------------------------------
-MULTI_ROI_FILE = "multivideo_roi_config.json"
+MULTI_ROI_FILE = r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\multivideo_roi_config.json"
 
 
 def _load_multi_roi_db(path: str) -> dict:
@@ -2908,7 +2983,7 @@ def main():
             camera_id=cam_id,
             src=src,
             roi_config_path=cam_roi_paths[cam_id],
-            fisheye_config_path=FISHEYE_CFG_STORE,
+            fisheye_config_path=r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\backend\outputs\lost_and_found\fisheye_view_configs.json",
             show_ui=True,
             source_kind="RTSP",
             desired_fps_fisheye=4.0,
