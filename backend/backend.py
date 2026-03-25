@@ -7351,3 +7351,76 @@ def get_upload_sources():
 
     out.sort(key=lambda x: (x["name"], x["id"]))
     return {"sources": out}
+
+    
+VIEW_MODE_OVERRIDE_LOCK = threading.Lock()
+VIEW_MODE_OVERRIDE_PATH = OUTPUTS_LF_DIR / "live_view_mode_overrides.json"
+VALID_VIEW_MODES = {"auto", "fisheye", "normal"}
+
+def _load_view_mode_overrides():
+    try:
+        if not VIEW_MODE_OVERRIDE_PATH.exists():
+            return {}
+
+        with open(VIEW_MODE_OVERRIDE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            cleaned = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str) and v in VALID_VIEW_MODES:
+                    cleaned[k] = v
+            return cleaned
+
+        return {}
+    except Exception as e:
+        print(f"[SYSTEM] Failed to load live view mode overrides: {e}")
+        return {}
+
+def _save_view_mode_overrides(data):
+    try:
+        VIEW_MODE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = VIEW_MODE_OVERRIDE_PATH.with_suffix(".tmp")
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        os.replace(tmp_path, VIEW_MODE_OVERRIDE_PATH)
+        return True
+    except Exception as e:
+        print(f"[SYSTEM] Failed to save live view mode overrides: {e}")
+        return False
+    
+@app.get("/api/live/view-mode-overrides")
+def get_live_view_mode_overrides():
+    with VIEW_MODE_OVERRIDE_LOCK:
+        data = _load_view_mode_overrides()
+    return data
+
+
+@app.post("/api/live/view-mode-overrides")
+def set_live_view_mode_overrides(payload: dict = Body(...)):
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Payload must be an object"}
+
+    cleaned = {}
+    for k, v in payload.items():
+        if not isinstance(k, str):
+            continue
+        if not isinstance(v, str):
+            continue
+
+        key = k.replace("_h264", "").strip()
+        val = v.strip().lower()
+
+        if not key:
+            continue
+        if val not in VALID_VIEW_MODES:
+            continue
+
+        cleaned[key] = val
+
+    with VIEW_MODE_OVERRIDE_LOCK:
+        ok = _save_view_mode_overrides(cleaned)
+
+    return {"ok": ok, "count": len(cleaned), "overrides": cleaned}
