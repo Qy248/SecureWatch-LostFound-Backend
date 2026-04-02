@@ -632,9 +632,9 @@ class PipelineConfig:
     num_workers: int = 1
     max_skip: int = 2
 
-    desired_fps_fisheye: float = 4.0
-    desired_fps_normal: float = 8.0
-    display_fps: float = 20.0
+    desired_fps_fisheye: float = 2.0
+    desired_fps_normal: float = 3.0
+    display_fps: float = 10.0
 
     show_ui: bool = True
     enable_detection: bool = True
@@ -667,12 +667,12 @@ class VideoPipeline:
             ["back_right_row", "back_left_row", "entrance", "back_corridor"],
         ]))
 
-        self.frame_queue = queue.Queue(maxsize=8)
-        self.raw_frame_queue = queue.Queue(maxsize=8)
-        self.frame_queue_a = queue.Queue(maxsize=8)
-        self.frame_queue_b = queue.Queue(maxsize=8)
-        self.bundle_job_queue = queue.Queue(maxsize=12)
-        self.det_out_queue = queue.Queue(maxsize=4)
+        self.frame_queue = queue.Queue(maxsize=4)
+        self.raw_frame_queue = queue.Queue(maxsize=4)
+        self.frame_queue_a = queue.Queue(maxsize=4)
+        self.frame_queue_b = queue.Queue(maxsize=4)
+        self.bundle_job_queue = queue.Queue(maxsize=6)
+        self.det_out_queue = queue.Queue(maxsize=2)
         self.out_queue = queue.Queue(maxsize=2)
 
         self.reader_thread = None
@@ -823,7 +823,7 @@ class VideoPipeline:
         except Exception:
             return
 
-    def _drop_stale_bundle_jobs(self, keep_latest: int = 2):
+    def _drop_stale_bundle_jobs(self, keep_latest: int = 1):
         try:
             items = []
             while True:
@@ -2114,7 +2114,7 @@ class VideoPipeline:
 
             if self._is_rtsp_source() and getattr(self.cfg, "drop_old_detection_jobs", True):
                 try:
-                    self._drop_stale_bundle_jobs(keep_latest=2)
+                    self._drop_stale_bundle_jobs(keep_latest=1)
                 except Exception:
                     pass
 
@@ -2396,7 +2396,7 @@ class VideoPipeline:
                 except Exception:
                     vid = 0
                 view_name = f"view_{vid}"
-        use_roi = False if draw_roi_overlay is None else bool(draw_roi_overlay)
+        use_roi = (False if draw_roi_overlay is None else bool(draw_roi_overlay)) and bool(self._detection_enabled)
 
         if use_roi and (not self.is_fisheye):
             polys = self._current_normal_polys()
@@ -2988,9 +2988,9 @@ def main():
             source_kind="RTSP",
             desired_fps_fisheye=4.0,
             desired_fps_normal=8.0,
-            base_frame_skip_fisheye_rtsp=1,
-            base_frame_skip_normal_rtsp=1,
-            base_frame_skip_fisheye_file=1,
+            base_frame_skip_fisheye_rtsp=3,
+            base_frame_skip_normal_rtsp=2,
+            base_frame_skip_fisheye_file=2,
             base_frame_skip_normal_file=1,
         )
         p = VideoPipeline(cfg, detector)

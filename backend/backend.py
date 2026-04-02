@@ -87,11 +87,22 @@ FISHEYE_VIEW_CONFIGS = getattr(lf, "FISHEYE_VIEW_CONFIGS", [])
 # Default settings
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "notifications_enabled": True,
-    "play_sound": True,
+    "notifications_sound_enabled": False,
+    "play_sound": False,
     "camera_enabled": True,
+    "data_retention_days": 90,
 }
 
-ALLOWED_SETTING_KEYS = set(DEFAULT_SETTINGS.keys())
+BOOLEAN_SETTING_KEYS = {
+    "notifications_enabled",
+    "notifications_sound_enabled",
+    "play_sound",
+    "camera_enabled",
+}
+INT_SETTING_KEYS = {
+    "data_retention_days",
+}
+ALLOWED_SETTING_KEYS = BOOLEAN_SETTING_KEYS | INT_SETTING_KEYS
 
 # Threading locks and caches
 _settings_lock = threading.Lock()
@@ -671,6 +682,140 @@ def save_lf_settings(data: Dict[str, Any]) -> Dict[str, Any]:
     with _settings_lock:
         _settings_cache = dict(out)
     return out
+
+def _normalize_lf_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cur = load_lf_settings()
+    out = dict(DEFAULT_SETTINGS)
+    out.update(cur)
+
+    payload = payload or {}
+
+    for key in BOOLEAN_SETTING_KEYS:
+        if key in payload:
+            out[key] = bool(payload.get(key))
+
+    if "data_retention_days" in payload:
+        try:
+            days = int(payload.get("data_retention_days"))
+        except Exception:
+            days = int(out.get("data_retention_days", 90) or 90)
+        out["data_retention_days"] = max(1, min(days, 3650))
+
+    # backward compatibility
+    if "play_sound" not in payload and "notifications_sound_enabled" in payload:
+        out["play_sound"] = bool(payload.get("notifications_sound_enabled"))
+
+    if "notifications_sound_enabled" not in payload and "play_sound" in payload:
+        out["notifications_sound_enabled"] = bool(payload.get("play_sound"))
+
+    return out
+
+
+def _item_ts_seconds(item: Dict[str, Any]) -> float:
+    for key in ("lastSeenTs", "firstSeenTs", "timestamp", "updatedAt", "createdAt"):
+        try:
+            val = item.get(key)
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _prune_json_store_file(path: Path, cutoff_ts: float) -> int:
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+
+    original_count = len(data)
+    kept = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            kept[key] = value
+            continue
+
+        ts = _item_ts_seconds(value)
+        if ts > 0 and ts < cutoff_ts:
+            continue
+        kept[key] = value
+
+    if len(kept) != original_count:
+        path.write_text(json.dumps(kept, indent=2), encoding="utf-8")
+    return original_count - len(kept)
+
+
+def _prune_old_output_files(root: Path, cutoff_ts: float) -> int:
+    if not root.exists():
+        return 0
+
+    removed = 0
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.name in {"roi_config.json", "_settings.json", "_overrides.json", "_items_store.json"}:
+            continue
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            continue
+        if mtime < cutoff_ts:
+            try:
+                p.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+def run_data_retention_cleanup() -> Dict[str, Any]:
+    settings = load_lf_settings()
+    days = int(settings.get("data_retention_days", 90) or 90)
+    days = max(1, min(days, 3650))
+    cutoff_ts = time.time() - (days * 86400)
+
+    removed_items = 0
+    removed_overrides = 0
+    removed_files = 0
+
+    with _items_store_lock:
+        removed_items += _prune_json_store_file(ITEMS_STORE_PATH, cutoff_ts)
+
+    with _overrides_lock:
+        removed_overrides += _prune_json_store_file(OVERRIDES_PATH, cutoff_ts)
+
+    removed_files += _prune_old_output_files(OUTPUTS_LF_DIR, cutoff_ts)
+    removed_files += _prune_old_output_files(PROJECT_OUTPUTS_LF_DIR, cutoff_ts)
+    removed_files += _prune_old_output_files(SNAPSHOT_DIR, cutoff_ts)
+
+    result = {
+        "ok": True,
+        "data_retention_days": days,
+        "cutoff_ts": cutoff_ts,
+        "removed_items": removed_items,
+        "removed_overrides": removed_overrides,
+        "removed_files": removed_files,
+    }
+    _system(
+        f"DATA RETENTION cleanup days={days} removed_items={removed_items} "
+        f"removed_overrides={removed_overrides} removed_files={removed_files}"
+    )
+    return result
+
+
+def data_retention_loop():
+    _system("DATA RETENTION worker started")
+    while True:
+        try:
+            run_data_retention_cleanup()
+        except Exception as e:
+            _system(f"DATA RETENTION worker error: {e}")
+        time.sleep(3600)
+
 
 
 # ============================================================
@@ -1696,10 +1841,10 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 camera_id=cam_id,
                 src=src,
                 roi_config_path=str(roi_path),
-                num_workers=2,
-                max_skip=2,
-                desired_fps_fisheye=5.0,
-                desired_fps_normal=5.0,
+                num_workers=1,
+                max_skip=3,
+                desired_fps_fisheye=3.0,
+                desired_fps_normal=3.0,
                 window_scale=0.80,
                 display_fps=10.0,
                 show_ui=False,
@@ -1786,9 +1931,9 @@ def _get_live_detector():
             items_weights=getattr(lf, "WEIGHTS_ITEMS", None),
             coco_weights=getattr(lf, "WEIGHTS_PERSON", None),
             device=device,
-            item_capture_conf=0.08,
-            coco_capture_conf=0.10,
-            person_conf=0.30,
+            item_capture_conf=0.25,
+            coco_capture_conf=0.25,
+            person_conf=0.45,
             track_win=10,
             confirm_k=3,
             hold_frames=15,
@@ -1878,16 +2023,14 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 camera_id=cam_id,
                 src=str(f),
                 roi_config_path=str(roi_path),
-                num_workers=2,
-                max_skip=2,
-                desired_fps_fisheye=5.0,
-                desired_fps_normal=5.0,
+                num_workers=1,
+                max_skip=3,
+                desired_fps_fisheye=3.0,
+                desired_fps_normal=3.0,
                 window_scale=0.80,
                 display_fps=10.0,
                 show_ui=False,
                 enable_detection=True,
-
-                # ✅ optional fields if you add them in video_pipeline.py
                 force_video_type=None,
                 source_kind="FILE",
             )
@@ -1914,18 +2057,24 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 camera_id=cam_id,
                 src=rec["url"],
                 roi_config_path=str(roi_path),
-                num_workers=2,
-                max_skip=2,
-                desired_fps_fisheye=5.0,
-                desired_fps_normal=5.0,
+                num_workers=1,
+                max_skip=3,
+                desired_fps_fisheye=2.0,
+                desired_fps_normal=3.0,
                 window_scale=0.80,
                 display_fps=10.0,
                 show_ui=False,
                 enable_detection=True,
-
                 # ✅ VERY IMPORTANT:
                 force_video_type=rec["video_type"],  # "normal" | "fisheye"
                 source_kind="RTSP",
+                base_frame_skip_fisheye_rtsp=6,
+                base_frame_skip_normal_rtsp=6,
+                base_frame_skip_fisheye_file=4,
+                base_frame_skip_normal_file=4,
+
+                drop_old_detection_jobs=True,
+                latest_only_tracking=True,
             )
 
             p = VideoPipeline(cfg, detector)
@@ -2074,7 +2223,7 @@ def live_pump() -> None:
                         for v in views_payload:
                             if not isinstance(v, dict):
                                 continue
-                            v["zones"] = v.get("zones", []) or []
+                            v["zones"] = []   # IMPORTANT: clear ROI overlay too
                             v["dets"] = []
                             v["detections"] = []
                             v["detection_enabled"] = False
@@ -2196,6 +2345,14 @@ def live_pump() -> None:
                             if enabled_classes.get(lab, True):
                                 kept.append(dd)
                         norm = kept
+                        # keep only top detections to reduce frontend / hub load
+                        try:
+                            norm.sort(key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
+                        except Exception:
+                            pass
+
+                        MAX_DETS_PER_VIEW = 15
+                        norm = norm[:MAX_DETS_PER_VIEW]
 
                     # IMPORTANT:
                     # if normal video and zones empty, force no detections
@@ -2651,6 +2808,11 @@ async def lifespan(app: FastAPI):
         _system("Startup: scanning offline_upload (manifest + auto-convert missing h264)...")
         _startup_scan_offline_folder()
 
+        try:
+            run_data_retention_cleanup()
+        except Exception as e:
+            _system(f"Startup: data retention cleanup failed: {e}")
+
         _system("Startup: scanning uploads for fisheye grid (non-blocking)...")
         files = list_upload_videos_h264_only()
         _system(f"Startup: found {len(files)} h264 uploads")
@@ -2685,6 +2847,7 @@ async def lifespan(app: FastAPI):
 
             # START THE VIDEO MONITOR THREAD
             threading.Thread(target=monitor_live_videos_loop, daemon=True).start()
+            threading.Thread(target=data_retention_loop, daemon=True).start()
 
             _system(f"LIVE pipelines started: {len(pipelines_live)} cameras")
             _system("LIVE video monitor started")
@@ -3013,28 +3176,26 @@ def get_lf_settings_api():
 
 
 @app.post("/api/lostfound/settings")
-def save_lf_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+def save_lf_settings_api(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Save ONLY minimal Lost & Found UI settings.
-    Ignore any extra frontend fields.
+    Save Lost & Found UI settings, including numeric data retention days.
     """
+    clean_settings = _normalize_lf_settings(payload)
+    saved = save_lf_settings(clean_settings)
 
-    # Start from defaults
-    clean_settings = DEFAULT_SETTINGS.copy()
+    try:
+        if "data_retention_days" in (payload or {}):
+            run_data_retention_cleanup()
+    except Exception as e:
+        _system(f"LF SETTINGS retention cleanup error: {e}")
 
-    # Only keep allowed keys
-    for key in ALLOWED_SETTING_KEYS:
-        if key in payload:
-            clean_settings[key] = bool(payload[key])
+    _system(f"LF SETTINGS saved keys: {list(saved.keys())}")
+    return saved
 
-    # Save to file
-    SETTINGS_PATH.write_text(
-        json.dumps(clean_settings, indent=2),
-        encoding="utf-8"
-    )
 
-    _system(f"LF SETTINGS saved keys: {list(clean_settings.keys())}")
-    return clean_settings
+@app.post("/api/lostfound/settings/retention/run")
+def run_lf_retention_cleanup_api() -> Dict[str, Any]:
+    return run_data_retention_cleanup()
 
 
 # ---------- dashboard cameras (from upload/*_h264.mp4) ----------
@@ -3399,6 +3560,9 @@ def live_frame(cam_id: str, view_idx: int):
             raise HTTPException(status_code=404, detail="no frame")
 
         if zones:
+           det_on = bool(getattr(p, "_detection_enabled", True)) if p is not None else True
+
+        if overlay == 1 and det_on and zones:
             fr = draw_zones_on_view(fr, zones, color=(0, 255, 0), thickness=2, show_id=True)
 
         return Response(
@@ -3545,7 +3709,9 @@ def live_group_frame(cam_id: str, group: str):
         if fr is None:
             raise HTTPException(status_code=404, detail="no frame")
 
-        if zones:
+        det_on = bool(getattr(p, "_detection_enabled", True)) if p is not None else True
+
+        if overlay == 1 and det_on and zones:
             fr = draw_zones_on_view(fr, zones, color=(0, 255, 0), thickness=2, show_id=True)
 
         return Response(
@@ -5668,7 +5834,8 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
             p = pipelines_live.get(cam_id)
             if p is not None and hasattr(p, "pull_single_view_jpg"):
                 try:
-                    jpg = p.pull_single_view_jpg(0, draw_roi_overlay=(overlay == 1))
+                    det_on = bool(getattr(p, "_detection_enabled", True))
+                    jpg = p.pull_single_view_jpg(0, draw_roi_overlay=((overlay == 1) and det_on))       
                     if jpg:
                         return jpg
                 except Exception:
@@ -5725,7 +5892,8 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
         # grid A/B
         if p is not None and hasattr(p, "pull_group_grid_jpg"):
             try:
-                jpg = p.pull_group_grid_jpg(g, draw_roi_overlay=(overlay == 1))
+                det_on = bool(getattr(p, "_detection_enabled", True))
+                jpg = p.pull_group_grid_jpg(g, draw_roi_overlay=((overlay == 1) and det_on))    
                 if jpg:
                     return jpg
             except Exception:
