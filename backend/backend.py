@@ -90,6 +90,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "notifications_sound_enabled": False,
     "play_sound": False,
     "camera_enabled": True,
+    "data_retention_enabled": True,
     "data_retention_days": 90,
 }
 
@@ -98,6 +99,7 @@ BOOLEAN_SETTING_KEYS = {
     "notifications_sound_enabled",
     "play_sound",
     "camera_enabled",
+    "data_retention_enabled",
 }
 INT_SETTING_KEYS = {
     "data_retention_days",
@@ -774,8 +776,22 @@ def _prune_old_output_files(root: Path, cutoff_ts: float) -> int:
 
 def run_data_retention_cleanup() -> Dict[str, Any]:
     settings = load_lf_settings()
+
+    enabled = bool(settings.get("data_retention_enabled", True))
     days = int(settings.get("data_retention_days", 90) or 90)
     days = max(1, min(days, 3650))
+
+    if not enabled:
+        return {
+            "ok": True,
+            "data_retention_enabled": False,
+            "data_retention_days": days,
+            "removed_items": 0,
+            "removed_overrides": 0,
+            "removed_files": 0,
+            "message": "Data retention disabled",
+        }
+
     cutoff_ts = time.time() - (days * 86400)
 
     removed_items = 0
@@ -794,6 +810,7 @@ def run_data_retention_cleanup() -> Dict[str, Any]:
 
     result = {
         "ok": True,
+        "data_retention_enabled": True,
         "data_retention_days": days,
         "cutoff_ts": cutoff_ts,
         "removed_items": removed_items,
@@ -801,11 +818,10 @@ def run_data_retention_cleanup() -> Dict[str, Any]:
         "removed_files": removed_files,
     }
     _system(
-        f"DATA RETENTION cleanup days={days} removed_items={removed_items} "
+        f"DATA RETENTION cleanup enabled={enabled} days={days} removed_items={removed_items} "
         f"removed_overrides={removed_overrides} removed_files={removed_files}"
     )
     return result
-
 
 def data_retention_loop():
     _system("DATA RETENTION worker started")
@@ -3197,6 +3213,42 @@ def save_lf_settings_api(payload: Dict[str, Any]) -> Dict[str, Any]:
 def run_lf_retention_cleanup_api() -> Dict[str, Any]:
     return run_data_retention_cleanup()
 
+@app.post("/api/lostfound/events/clear_all")
+def clear_all_lostfound_events() -> Dict[str, Any]:
+    removed_files = 0
+
+    try:
+        with _items_store_lock:
+            if ITEMS_STORE_PATH.exists():
+                ITEMS_STORE_PATH.write_text("[]", encoding="utf-8")
+
+        with _overrides_lock:
+            if OVERRIDES_PATH.exists():
+                OVERRIDES_PATH.write_text("[]", encoding="utf-8")
+
+        for base_dir in [OUTPUTS_LF_DIR, PROJECT_OUTPUTS_LF_DIR, SNAPSHOT_DIR]:
+            if not base_dir.exists():
+                continue
+            for p in base_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name in {"roi_config.json", "_settings.json"}:
+                    continue
+                try:
+                    p.unlink(missing_ok=True)
+                    removed_files += 1
+                except Exception:
+                    pass
+
+        _system(f"LF EVENTS clear_all removed_files={removed_files}")
+        return {
+            "ok": True,
+            "removed_files": removed_files,
+            "message": "All Lost & Found events cleared",
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"clear_all failed: {e}")
 
 # ---------- dashboard cameras (from upload/*_h264.mp4) ----------
 @app.get("/api/lostfound/cameras")
