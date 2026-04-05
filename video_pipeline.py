@@ -580,16 +580,30 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
         self._refresh_roi_cache_if_needed()
         with self._roi_lock:
             return dict(self._roi_cache or {})
+        
+    def _largest_poly_only(self, polys):
+        try:
+            zones = lf.polygons_to_zones(polys or [], start_id=1, id_key="roi_id")
+            largest = lf.get_largest_roi(zones)
+            if not largest:
+                return []
+            pts = largest.get("points", []) or []
+            return [[{"x": float(x), "y": float(y)} for (x, y) in pts]]
+        except Exception:
+            return []
 
     def _draw_polygon_list(self, img, polys, color=(0, 255, 0), thickness=2):
         if img is None:
             return img
+
+        polys = self._largest_poly_only(polys)
+
         for poly in (polys or []):
             if isinstance(poly, list) and len(poly) >= 3:
                 try:
                     pts = np.array(
                         [[int(p["x"]), int(p["y"])] for p in poly if isinstance(p, dict)],
-                        dtype=np.int32
+                        dtype=np.int32,
                     )
                     if len(pts) >= 3:
                         cv2.polylines(img, [pts], True, color, thickness)

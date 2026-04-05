@@ -7934,6 +7934,10 @@ def get_upload_sources():
 VIEW_MODE_OVERRIDE_LOCK = threading.Lock()
 VIEW_MODE_OVERRIDE_PATH = OUTPUTS_LF_DIR / "live_view_mode_overrides.json"
 VALID_VIEW_MODES = {"auto", "fisheye", "normal"}
+LIVE_ACTIVE_SEQUENCE_LOCK = threading.Lock()
+LIVE_ACTIVE_SEQUENCE_PATH = OUTPUTS_LF_DIR / "live_active_sequence.json"
+VALID_LIVE_MODES = {"lost-found", "attire"}
+MAX_ACTIVE_LIVE_STREAMS = 4
 
 def _load_view_mode_overrides():
     try:
@@ -8003,4 +8007,92 @@ def set_live_view_mode_overrides(payload: dict = Body(...)):
 
     return {"ok": ok, "count": len(cleaned), "overrides": cleaned}
 
+def _load_live_active_sequence():
+    try:
+        if not LIVE_ACTIVE_SEQUENCE_PATH.exists():
+            return {"lost-found": [], "attire": []}
+
+        with open(LIVE_ACTIVE_SEQUENCE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {"lost-found": [], "attire": []}
+
+        out = {"lost-found": [], "attire": []}
+        for mode in ("lost-found", "attire"):
+            arr = data.get(mode, [])
+            if isinstance(arr, list):
+                cleaned = []
+                for x in arr:
+                    cam_id = str(x or "").replace("_h264", "").strip()
+                    if cam_id and cam_id not in cleaned:
+                        cleaned.append(cam_id)
+                out[mode] = cleaned[:MAX_ACTIVE_LIVE_STREAMS]
+
+        return out
+    except Exception as e:
+        print(f"[SYSTEM] Failed to load live active sequence: {e}")
+        return {"lost-found": [], "attire": []}
+
+
+def _save_live_active_sequence(data):
+    try:
+        LIVE_ACTIVE_SEQUENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = LIVE_ACTIVE_SEQUENCE_PATH.with_suffix(".tmp")
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        os.replace(tmp_path, LIVE_ACTIVE_SEQUENCE_PATH)
+        return True
+    except Exception as e:
+        print(f"[SYSTEM] Failed to save live active sequence: {e}")
+        return False
+    
+@app.get("/api/live/active-sequence")
+def get_live_active_sequence(mode: str = "lost-found"):
+    mode = str(mode or "lost-found").strip().lower()
+    if mode not in VALID_LIVE_MODES:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+
+    with LIVE_ACTIVE_SEQUENCE_LOCK:
+        data = _load_live_active_sequence()
+
+    return {
+        "mode": mode,
+        "active_cam_ids": data.get(mode, [])
+    }
+
+
+@app.post("/api/live/active-sequence")
+def set_live_active_sequence(payload: dict = Body(...)):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload must be an object")
+
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in VALID_LIVE_MODES:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+
+    arr = payload.get("active_cam_ids", [])
+    if not isinstance(arr, list):
+        raise HTTPException(status_code=400, detail="active_cam_ids must be a list")
+
+    cleaned = []
+    for x in arr:
+        cam_id = str(x or "").replace("_h264", "").strip()
+        if cam_id and cam_id not in cleaned:
+            cleaned.append(cam_id)
+
+    cleaned = cleaned[:MAX_ACTIVE_LIVE_STREAMS]
+
+    with LIVE_ACTIVE_SEQUENCE_LOCK:
+        data = _load_live_active_sequence()
+        data[mode] = cleaned
+        ok = _save_live_active_sequence(data)
+
+    return {
+        "ok": ok,
+        "mode": mode,
+        "active_cam_ids": cleaned
+    }
 

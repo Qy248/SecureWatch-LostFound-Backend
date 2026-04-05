@@ -2061,16 +2061,8 @@ def build_views_grid(views, draw_zones=True):
         def maybe_draw_zones(img, zones):
             if not draw_zones:
                 return img
+            return draw_zones_on_view(img, zones or [])
 
-            zones = normalize_zones(zones or [])
-            if not zones:
-                return img
-
-            largest = get_largest_roi(zones)
-            if largest is None:
-                return img
-
-            return draw_zones_on_view(img, [largest])
         # ----- case 1: single view -----
         if len(views) == 1:
             v = views[0]
