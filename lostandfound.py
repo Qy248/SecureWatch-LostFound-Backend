@@ -2061,8 +2061,16 @@ def build_views_grid(views, draw_zones=True):
         def maybe_draw_zones(img, zones):
             if not draw_zones:
                 return img
-            return draw_zones_on_view(img, zones or [])
 
+            zones = normalize_zones(zones or [])
+            if not zones:
+                return img
+
+            largest = get_largest_roi(zones)
+            if largest is None:
+                return img
+
+            return draw_zones_on_view(img, [largest])
         # ----- case 1: single view -----
         if len(views) == 1:
             v = views[0]
@@ -2269,7 +2277,6 @@ class FrameReaderThread(threading.Thread):
             put_drop_oldest(self.frame_queue, (SENTINEL, None, None))
             logger.info("[FrameReaderThread] Exiting.")
 
-
 class ViewProcessorThread(threading.Thread):
     """
     Converts frame -> views (fisheye: 4 views; normal: 1 view)
@@ -2351,9 +2358,21 @@ class DetectionWorkerThread(threading.Thread):
 
     Output bundle (to det_out_queue):
       (frame_idx, ts, gi, out_views)
+
+    analysis_fps:
+      - None / 0 => no throttling
+      - >0       => process at this max rate
     """
-    def __init__(self, worker_id: int, detector, job_queue: queue.Queue, out_queue: queue.Queue,
-                 stop_event: threading.Event, batch_size: int = 1):
+    def __init__(
+        self,
+        worker_id: int,
+        detector,
+        job_queue: queue.Queue,
+        out_queue: queue.Queue,
+        stop_event: threading.Event,
+        batch_size: int = 1,
+        analysis_fps: float | None = None,
+    ):
         super().__init__(daemon=True)
         self.worker_id = worker_id
         self.detector = detector
@@ -2361,6 +2380,9 @@ class DetectionWorkerThread(threading.Thread):
         self.out_queue = out_queue
         self.stop_event = stop_event
         self.batch_size = max(1, int(batch_size))
+
+        self.analysis_fps = float(analysis_fps) if analysis_fps and analysis_fps > 0 else None
+        self._next_analysis_t = 0.0
 
         self.tracker_mgr = DeepSortTrackerManager(track_items_only=True)
         self._last_frame_idx = {}
@@ -2371,6 +2393,17 @@ class DetectionWorkerThread(threading.Thread):
             return True
         self._last_frame_idx[view_name] = frame_idx
         return False
+
+    def _allow_analysis_now(self) -> bool:
+        if not self.analysis_fps:
+            return True
+
+        now_t = time.monotonic()
+        if now_t < self._next_analysis_t:
+            return False
+
+        self._next_analysis_t = now_t + (1.0 / float(self.analysis_fps))
+        return True
 
     def run(self):
         logger.info(f"[DetectionWorker-{self.worker_id}] Started.")
@@ -2398,6 +2431,10 @@ class DetectionWorkerThread(threading.Thread):
                         if not views:
                             continue
 
+                        # throttle HEAVY detection here, not in ViewProcessorThread
+                        if not self._allow_analysis_now():
+                            continue
+
                         out_views = []
                         for v in views:
                             img = v.get("image", None)
@@ -2408,11 +2445,11 @@ class DetectionWorkerThread(threading.Thread):
                             view_name = v.get("name", f"view_{view_id}")
                             zones = normalize_zones(v.get("zones", []) or [])
 
-                            # ✅ largest ROI only
+                            # largest ROI only
                             largest_roi = get_largest_roi(zones)
                             zones_for_crop = [largest_roi] if largest_roi is not None else []
 
-                            # ✅ no ROI => no detection
+                            # no ROI => no detection
                             if not zones_for_crop:
                                 annotated = draw_zones_on_view(img.copy(), zones_for_crop)
                                 out_views.append({
@@ -2455,6 +2492,7 @@ class DetectionWorkerThread(threading.Thread):
                                     or largest_roi.get("zone_id")
                                     or largest_roi.get("id")
                                 )
+
                             if selected_roi_id is not None:
                                 for d in detections:
                                     d["roi_id"] = str(selected_roi_id)
@@ -2472,7 +2510,6 @@ class DetectionWorkerThread(threading.Thread):
                                 "zones": zones_for_crop
                             })
 
-                        # ✅ MUST pass ts through
                         put_drop_oldest(self.out_queue, (frame_idx, ts, gi, out_views))
 
                     except Exception:
@@ -2484,7 +2521,6 @@ class DetectionWorkerThread(threading.Thread):
                             pass
         finally:
             logger.info(f"[DetectionWorker-{self.worker_id}] Exiting.")
-
 class SupervisorThread(threading.Thread):
     def __init__(self, reader_thread, bundle_job_queue, stop_event, max_skip=3):
         super().__init__(daemon=True)

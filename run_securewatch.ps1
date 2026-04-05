@@ -1,9 +1,10 @@
 $projectDir = "D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch"
-$restartSec = 3600   # change later to 7200 if needed
+$restartSec = 3600
 
 Set-Location $projectDir
 
 $lostProc = $null
+$attireProc = $null
 
 function Start-BackendWindow {
     param(
@@ -47,10 +48,15 @@ try {
         # Lost & Found backend window
         $lostProc = Start-BackendWindow `
             -Title "Lost & Found Backend :8000" `
-            -Command "uvicorn backend.backend:app --host 0.0.0.0 --port $PORT"
+            -Command '$env:UVICORN_RELOAD=""; python -m uvicorn backend.backend:app --host 0.0.0.0 --port 8000 --log-level warning --no-access-log'
 
- 
+        # Attire backend window
+        $attireProc = Start-BackendWindow `
+            -Title "Attire Backend :8001" `
+            -Command '$env:UVICORN_RELOAD=""; python -m uvicorn server:app --host 0.0.0.0 --port 8001 --log-level warning --no-access-log'
+
         Write-Host "Lost & Found backend window PID: $($lostProc.Id)"
+        Write-Host "Attire backend window PID: $($attireProc.Id)"
         Write-Host "Waiting $restartSec seconds before restart..."
         Write-Host "Press CTRL+C once to stop everything."
 
@@ -60,6 +66,7 @@ try {
             Start-Sleep -Seconds 1
 
             $lostExited = $true
+            $attireExited = $true
 
             try {
                 if ($lostProc) { $lostExited = $lostProc.HasExited }
@@ -67,8 +74,16 @@ try {
                 $lostExited = $true
             }
 
-            if ($lostExited) {
+            try {
+                if ($attireProc) { $attireExited = $attireProc.HasExited }
+            } catch {
+                $attireExited = $true
+            }
+
+            if ($lostExited -or $attireExited) {
                 Write-Host "One backend exited by itself."
+                Stop-BackendProcessTree -Proc $lostProc
+                Stop-BackendProcessTree -Proc $attireProc
                 break
             }
 
@@ -76,6 +91,7 @@ try {
             if ($elapsed.TotalSeconds -ge $restartSec) {
                 Write-Host "Restart interval reached. Stopping both backends..."
                 Stop-BackendProcessTree -Proc $lostProc
+                Stop-BackendProcessTree -Proc $attireProc
                 break
             }
         }
@@ -89,5 +105,6 @@ catch {
 }
 finally {
     Stop-BackendProcessTree -Proc $lostProc
+    Stop-BackendProcessTree -Proc $attireProc
     Write-Host "Launcher stopped."
 }

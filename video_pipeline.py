@@ -622,6 +622,169 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
         vals = fish.get(view_name, [])
         return vals if isinstance(vals, list) else []
 
+class RealtimeFreshRTSPReaderThread(threading.Thread):
+    """
+    RTSP reader tuned to behave closer to Attire:
+    - small internal RTSP buffer
+    - one-frame-per-loop pacing
+    - no aggressive catch-up / no skip-seconds logic
+    - reconnect on failure
+    - keeps Lost & Found downstream pipeline unchanged
+    """
+
+    def __init__(
+        self,
+        preprocessor,
+        out_queue,
+        stop_event,
+        target_fps: float = 4.5,
+        warmup_grabs: int = 2,
+        flush_grabs_per_cycle: int = 0,
+        reconnect_backoff_sec: float = 0.5,
+        max_reconnect_backoff_sec: float = 5.0,
+        queue_put_fn=None,
+    ):
+        super().__init__(daemon=True)
+        self.preprocessor = preprocessor
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+
+        self.target_fps = max(1.0, float(target_fps or 6.0))
+        self.frame_period = 1.0 / self.target_fps
+
+        self.warmup_grabs = max(0, int(warmup_grabs))
+        self.flush_grabs_per_cycle = max(0, int(flush_grabs_per_cycle))
+
+        self.reconnect_backoff_sec = float(reconnect_backoff_sec)
+        self.max_reconnect_backoff_sec = float(max_reconnect_backoff_sec)
+
+        self.queue_put_fn = queue_put_fn or lf.put_drop_oldest
+        self._reconnect_wait = self.reconnect_backoff_sec
+        self.frame_skip = 0
+
+    def _get_cap(self):
+        return getattr(self.preprocessor, "cap", None)
+
+    def _apply_low_buffer(self, cap):
+        if cap is None:
+            return
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+    def _warmup_cap(self, cap):
+        if cap is None:
+            return
+        for _ in range(self.warmup_grabs):
+            try:
+                if not cap.grab():
+                    break
+            except Exception:
+                break
+
+    def _safe_reconnect(self) -> bool:
+        try:
+            if hasattr(self.preprocessor, "release"):
+                self.preprocessor.release()
+        except Exception:
+            pass
+
+        time.sleep(min(self._reconnect_wait, self.max_reconnect_backoff_sec))
+        self._reconnect_wait = min(self._reconnect_wait * 1.6, self.max_reconnect_backoff_sec)
+
+        ok = False
+        try:
+            if hasattr(self.preprocessor, "src"):
+                ok = bool(self.preprocessor.open(self.preprocessor.src))
+            elif hasattr(self.preprocessor, "video_path"):
+                ok = bool(self.preprocessor.open(self.preprocessor.video_path))
+            else:
+                ok = bool(self.preprocessor.open())
+        except Exception:
+            try:
+                ok = bool(self.preprocessor.open())
+            except Exception:
+                ok = False
+
+        if not ok:
+            return False
+
+        cap = self._get_cap()
+        self._apply_low_buffer(cap)
+        self._warmup_cap(cap)
+
+        self._reconnect_wait = self.reconnect_backoff_sec
+        return True
+
+    def run(self):
+        # initialize first schedule anchor
+        self._next_due = time.time()
+
+        # apply low-buffer once at start
+        try:
+            self._apply_low_buffer(self._get_cap())
+        except Exception:
+            pass
+
+        while not self.stop_event.is_set():
+            try:
+                # wait until next frame time
+                now = time.time()
+                wait_s = self._next_due - now
+                if wait_s > 0:
+                    time.sleep(wait_s)
+
+                cap = self._get_cap()
+                if cap is None:
+                    if not self._safe_reconnect():
+                        continue
+                    cap = self._get_cap()
+                    if cap is None:
+                        time.sleep(0.05)
+                        self._next_due = time.time() + self.frame_period
+                        continue
+
+                # keep this 0 unless you really need tiny freshness correction
+                for _ in range(self.flush_grabs_per_cycle):
+                    try:
+                        if not cap.grab():
+                            break
+                    except Exception:
+                        break
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    if not self._safe_reconnect():
+                        continue
+                    self._next_due = time.time() + self.frame_period
+                    continue
+
+                ts = time.time()
+
+                # prevent queue backlog from building
+                try:
+                    while self.out_queue.qsize() >= 1:
+                        self.out_queue.get_nowait()
+                except Exception:
+                    pass
+
+                self.queue_put_fn(self.out_queue, (ts, None, frame))
+
+                # IMPORTANT:
+                # reset next due from real wall-clock time
+                # do NOT accumulate with +=
+                self._next_due = time.time() + self.frame_period
+
+            except Exception:
+                time.sleep(0.05)
+                self._next_due = time.time() + self.frame_period
+
+        try:
+            self.queue_put_fn(self.out_queue, (lf.SENTINEL,))
+        except Exception:
+            pass
+            
 
 @dataclass
 class PipelineConfig:
@@ -633,18 +796,18 @@ class PipelineConfig:
     max_skip: int = 2
 
     desired_fps_fisheye: float = 2.0
-    desired_fps_normal: float = 3.0
-    display_fps: float = 10.0
+    desired_fps_normal: float = 2.0
+    display_fps: float = 8.0
 
     show_ui: bool = True
     enable_detection: bool = True
     force_video_type: Optional[str] = None
     source_kind: str = "FILE"
 
-    base_frame_skip_fisheye_rtsp: int = 2
-    base_frame_skip_normal_rtsp: int = 1
-    base_frame_skip_fisheye_file: int = 1
-    base_frame_skip_normal_file: int = 1
+    base_frame_skip_fisheye_rtsp: int = 0
+    base_frame_skip_normal_rtsp: int = 0
+    base_frame_skip_fisheye_file: int = 0
+    base_frame_skip_normal_file: int = 0
 
     drop_old_detection_jobs: bool = True
     latest_only_tracking: bool = True
@@ -1654,6 +1817,8 @@ class VideoPipeline:
         self._drain_q(self.out_queue)
         self._drain_q(self.bundle_job_queue, max_items=999999)
 
+        analysis_fps = self.target_fps if self._is_rtsp_source() else None
+
         self.workers = [
             lf.DetectionWorkerThread(
                 i,
@@ -1661,6 +1826,8 @@ class VideoPipeline:
                 self.bundle_job_queue,
                 self.det_out_queue,
                 self.det_stop_event,
+                batch_size=1,
+                analysis_fps=analysis_fps,
             )
             for i in range(int(self.cfg.num_workers))
         ]
@@ -1792,72 +1959,181 @@ class VideoPipeline:
             self._stop_detection_threads()
             self._start_display_only_pumps()
 
-    def start(self) -> bool:
+    def start(self):
         try:
-            vtype = self._normalized_video_type()
-            self.is_fisheye = (vtype == "FISHEYE")
-            self.views_expected = 4 if self.is_fisheye else 1
+            lf._step("PHASE 2", f"Starting pipeline for {self.cfg.camera_id}")
 
-            self._roi_available_for_detection = self._has_roi_for_detection()
+            # ---------------------------------------------------------
+            # reset runtime state
+            # ---------------------------------------------------------
+            self.stop_event.clear()
+            self.det_stop_event = None
 
-            if not self._open_preprocessor(vtype):
-                lf._step("ERROR", f"{self.cfg.camera_id} preprocessor open failed")
-                return False
+            self._detection_enabled = bool(self.cfg.enable_detection)
 
             try:
-                cap = getattr(self.preprocessor, "cap", None)
-                fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap is not None else 0.0
+                self._roi_dirty = True
+                self.reload_roi()
             except Exception:
-                fps = 0.0
-            if fps <= 0:
-                fps = 10.0
-            self.video_fps = fps
+                self._roi_available_for_detection = self._has_roi_for_detection()
+
+            try:
+                self._fisheye_cfg_dirty = True
+            except Exception:
+                pass
+
+            # ---------------------------------------------------------
+            # decide video type
+            # ---------------------------------------------------------
+            mode = self._normalized_video_type()
+            self.is_fisheye = (str(mode).upper() == "FISHEYE")
+
+            # ---------------------------------------------------------
+            # open preprocessor
+            # ---------------------------------------------------------
+            if self.is_fisheye:
+                self.preprocessor = lf.FisheyePreprocessor(
+                    view_configs=self._load_latest_fisheye_configs_for_cam() or self._default_fisheye_view_configs(),
+                    config_path=self.cfg.roi_config_path,
+                )
+                self.preprocessor.open(self.cfg.src)
+                self.views_expected = 8
+            else:
+                self.preprocessor = lf.NormalPreprocessor(
+                    self.cfg.src,
+                    config_path=self.cfg.roi_config_path,
+                )
+                ok = self.preprocessor.open()
+                if ok is False:
+                    raise RuntimeError(f"Cannot open source: {self.cfg.src}")
+                self.views_expected = 1
+
+            # ---------------------------------------------------------
+            # read source FPS
+            # ---------------------------------------------------------
+            cap = getattr(self.preprocessor, "cap", None)
+            fps = 0.0
+            if cap is not None:
+                try:
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                except Exception:
+                    fps = 0.0
+
+            if not fps or fps <= 1.0:
+                fps = 25.0 if self._is_rtsp_source() else 25.0
+
+            self.video_fps = float(fps)
 
             desired = self.cfg.desired_fps_fisheye if self.is_fisheye else self.cfg.desired_fps_normal
-            self.target_fps = min(float(desired), float(self.video_fps))
+            desired = float(desired or 1.0)
+
+            if self._is_rtsp_source():
+                # RTSP: use requested analysis FPS directly
+                self.target_fps = max(0.1, desired)
+            else:
+                # FILE: do not exceed native FPS
+                self.target_fps = min(float(desired), float(self.video_fps))
+
+            # ---------------------------------------------------------
+            # refresh ROI availability
+            # ---------------------------------------------------------
+            self._roi_available_for_detection = self._has_roi_for_detection()
+
+            # ---------------------------------------------------------
+            # RTSP or FILE reader choice
+            # ---------------------------------------------------------
+            is_rtsp = self._is_rtsp_source()
 
             if self.is_fisheye:
-                self.reader_thread = lf.FrameReaderThread(
-                    self.preprocessor,
-                    self.raw_frame_queue,
-                    self.stop_event,
-                    frame_skip=self._get_base_frame_skip(),
-                    target_fps=self.target_fps,
+                if is_rtsp:
+                    # IMPORTANT:
+                    # fisheye RTSP must feed raw_frame_queue because fanout thread reads
+                    # raw_frame_queue -> frame_queue_a / frame_queue_b
+                    self.reader_thread = RealtimeFreshRTSPReaderThread(
+                        self.preprocessor,
+                        self.raw_frame_queue,
+                        self.stop_event,
+                        target_fps=self.cfg.display_fps,
+                        warmup_grabs=2.3,
+                        flush_grabs_per_cycle=0.9,
+                    )
+                else:
+                    self.reader_thread = lf.FrameReaderThread(
+                        self.preprocessor,
+                        self.raw_frame_queue,
+                        self.stop_event,
+                        frame_skip=self._get_base_frame_skip(),
+                        target_fps=None,
+                        is_realtime=False,
+                    )
+
+                self.fanout_thread = threading.Thread(
+                    target=self._fanout_frames_loop,
+                    daemon=True
                 )
-                self.fanout_thread = threading.Thread(target=self._fanout_frames_loop, daemon=True)
 
                 av_a, av_b = self._make_active_views_pair(
                     getattr(self.preprocessor, "view_configs", None)
                 )
 
                 self.processor_thread_a = ViewProcessorThreadCam(
-                    self.cfg.camera_id, self.preprocessor, self.frame_queue_a,
-                    self.bundle_job_queue, self.stop_event, av_a,
+                    self.cfg.camera_id,
+                    self.preprocessor,
+                    self.frame_queue_a,
+                    self.bundle_job_queue,
+                    self.stop_event,
+                    av_a,
                 )
+
                 self.processor_thread_b = ViewProcessorThreadCam(
-                    self.cfg.camera_id, self.preprocessor, self.frame_queue_b,
-                    self.bundle_job_queue, self.stop_event, av_b,
+                    self.cfg.camera_id,
+                    self.preprocessor,
+                    self.frame_queue_b,
+                    self.bundle_job_queue,
+                    self.stop_event,
+                    av_b,
                 )
 
                 self.reader_thread.start()
                 self.fanout_thread.start()
                 self.processor_thread_a.start()
                 self.processor_thread_b.start()
+
             else:
-                self.reader_thread = lf.FrameReaderThread(
+                if is_rtsp:
+                    self.reader_thread = RealtimeFreshRTSPReaderThread(
+                        self.preprocessor,
+                        self.frame_queue,
+                        self.stop_event,
+                        target_fps=self.cfg.display_fps,
+                        warmup_grabs=2.3,
+                        flush_grabs_per_cycle=0.9,
+                    )
+                else:
+                    self.reader_thread = lf.FrameReaderThread(
+                        self.preprocessor,
+                        self.frame_queue,
+                        self.stop_event,
+                        frame_skip=self._get_base_frame_skip(),
+                        target_fps=None,
+                        is_realtime=False,
+                    )
+
+                self.processor_thread = ViewProcessorThreadCam(
+                    self.cfg.camera_id,
                     self.preprocessor,
                     self.frame_queue,
+                    self.bundle_job_queue,
                     self.stop_event,
-                    frame_skip=self._get_base_frame_skip(),
-                    target_fps=self.target_fps,
+                    self.active_views,
                 )
-                self.processor_thread = ViewProcessorThreadCam(
-                    self.cfg.camera_id, self.preprocessor, self.frame_queue,
-                    self.bundle_job_queue, self.stop_event, self.active_views,
-                )
+
                 self.reader_thread.start()
                 self.processor_thread.start()
 
+            # ---------------------------------------------------------
+            # detection or display-only mode
+            # ---------------------------------------------------------
             detection_can_run = bool(
                 self.cfg.enable_detection
                 and self._detection_enabled
@@ -1873,6 +2149,9 @@ class VideoPipeline:
                 if self.cfg.enable_detection and not self._roi_available_for_detection:
                     lf._step("UI", f"{self.cfg.camera_id} detection skipped (no ROI configured)")
 
+            # ---------------------------------------------------------
+            # optional UI window
+            # ---------------------------------------------------------
             if self.cfg.show_ui:
                 try:
                     cv2.namedWindow(self.win_name, cv2.WINDOW_NORMAL)
@@ -1880,6 +2159,9 @@ class VideoPipeline:
                 except Exception:
                     pass
 
+            # ---------------------------------------------------------
+            # concise runtime log
+            # ---------------------------------------------------------
             lf._kv(
                 "PHASE 2",
                 cam=self.cfg.camera_id,
@@ -1893,6 +2175,7 @@ class VideoPipeline:
                 enable_detection=bool(detection_can_run),
                 frame_skip=self._get_base_frame_skip(),
             )
+
             return True
 
         except Exception as e:
@@ -2987,11 +3270,11 @@ def main():
             show_ui=True,
             source_kind="RTSP",
             desired_fps_fisheye=4.0,
-            desired_fps_normal=8.0,
-            base_frame_skip_fisheye_rtsp=3,
-            base_frame_skip_normal_rtsp=2,
-            base_frame_skip_fisheye_file=2,
-            base_frame_skip_normal_file=1,
+            desired_fps_normal=4.0,
+            base_frame_skip_fisheye_rtsp=0,
+            base_frame_skip_normal_rtsp=0,
+            base_frame_skip_fisheye_file=0,
+            base_frame_skip_normal_file=0,
         )
         p = VideoPipeline(cfg, detector)
         if p.start():

@@ -40,7 +40,7 @@
       "uploadDate": 1774544745,
       "h264_name": "B100AA_B_Block_B_Block_20251110101000_20251110104057_40572919_h264.mp4",
       "h264_ready": true,
-      "roi_ready": false,
+      "roi_ready": true,
       "status": "ready",
       "error": null,
       "duration": "00:30:57"
@@ -51,7 +51,7 @@
       "uploadDate": 1774544756,
       "h264_name": "B100D_B_Block_B_Block_20251110101000_20251110104057_40572930_h264.mp4",
       "h264_ready": true,
-      "roi_ready": false,
+      "roi_ready": true,
       "status": "ready",
       "error": null,
       "duration": "00:30:57"

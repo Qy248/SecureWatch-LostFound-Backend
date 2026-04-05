@@ -22,6 +22,10 @@ from urllib.parse import urlsplit, urlunsplit, quote, unquote
 import signal
 # Third-party imports
 import cv2
+from collections import deque
+
+LIVE_VIEW_SESSIONS: Dict[str, Any] = {}
+LIVE_VIEW_LOCK = threading.Lock()
 
 cv2.setNumThreads(1)
 import numpy as np
@@ -724,18 +728,14 @@ def _item_ts_seconds(item: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _prune_json_store_file(path: Path, cutoff_ts: float) -> int:
-    if not path.exists():
-        return 0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
+def _prune_json_store_shards(root: Path, prefix: str, cutoff_ts: float, per_file: int) -> int:
+    data = _lf_load_all_shards(root, prefix)
     if not isinstance(data, dict):
         return 0
 
     original_count = len(data)
     kept = {}
+
     for key, value in data.items():
         if not isinstance(value, dict):
             kept[key] = value
@@ -744,11 +744,35 @@ def _prune_json_store_file(path: Path, cutoff_ts: float) -> int:
         ts = _item_ts_seconds(value)
         if ts > 0 and ts < cutoff_ts:
             continue
+
         kept[key] = value
 
     if len(kept) != original_count:
-        path.write_text(json.dumps(kept, indent=2), encoding="utf-8")
+        _lf_rewrite_all_shards(root, prefix, kept, per_file)
+
     return original_count - len(kept)
+
+LF_EVENT_FILE_NAMES = {
+    "lost_items.json",
+    "lost_items.csv",
+    "event_log.jsonl",
+    "progress.json",
+    "offline_analyze.log",
+}
+
+LF_EVENT_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _is_safe_lf_event_file(p: Path) -> bool:
+    if not p.is_file():
+        return False
+
+    # ONLY allow deletion of log/json/csv files
+    if p.name in LF_EVENT_FILE_NAMES:
+        return True
+
+    # NEVER delete snapshot/evidence images automatically
+    return False
 
 
 def _prune_old_output_files(root: Path, cutoff_ts: float) -> int:
@@ -759,20 +783,26 @@ def _prune_old_output_files(root: Path, cutoff_ts: float) -> int:
     for p in root.rglob("*"):
         if not p.is_file():
             continue
-        if p.name in {"roi_config.json", "_settings.json", "_overrides.json", "_items_store.json"}:
+
+        # IMPORTANT:
+        # _is_safe_lf_event_file now deletes ONLY json/csv/log files.
+        # Snapshot images are intentionally preserved.
+        if not _is_safe_lf_event_file(p):
             continue
+
         try:
             mtime = float(p.stat().st_mtime)
         except Exception:
             continue
+
         if mtime < cutoff_ts:
             try:
                 p.unlink(missing_ok=True)
                 removed += 1
             except Exception:
                 pass
-    return removed
 
+    return removed
 
 def run_data_retention_cleanup() -> Dict[str, Any]:
     settings = load_lf_settings()
@@ -799,14 +829,23 @@ def run_data_retention_cleanup() -> Dict[str, Any]:
     removed_files = 0
 
     with _items_store_lock:
-        removed_items += _prune_json_store_file(ITEMS_STORE_PATH, cutoff_ts)
+        removed_items += _prune_json_store_shards(
+            LF_STORE_ITEMS_DIR,
+            LF_STORE_ITEMS_PREFIX,
+            cutoff_ts,
+            LF_ITEMS_PER_FILE,
+        )
 
     with _overrides_lock:
-        removed_overrides += _prune_json_store_file(OVERRIDES_PATH, cutoff_ts)
+        removed_overrides += _prune_json_store_shards(
+            LF_STORE_OVERRIDES_DIR,
+            LF_STORE_OVERRIDES_PREFIX,
+            cutoff_ts,
+            LF_OVERRIDES_PER_FILE,
+        )
 
     removed_files += _prune_old_output_files(OUTPUTS_LF_DIR, cutoff_ts)
     removed_files += _prune_old_output_files(PROJECT_OUTPUTS_LF_DIR, cutoff_ts)
-    removed_files += _prune_old_output_files(SNAPSHOT_DIR, cutoff_ts)
 
     result = {
         "ok": True,
@@ -1787,9 +1826,15 @@ def check_and_restart_ended_videos():
 
 def restart_single_live_camera(cam_id: str) -> bool:
     """
-    Restart a single live camera pipeline.
-    ✅ Uses get_live_source() so RTSP URL is used when configured,
-       falling back to uploaded file when no RTSP is set.
+    Restart one LIVE camera pipeline.
+    Supports BOTH:
+    - upload/file source
+    - RTSP source
+
+    Important:
+    - keeps ROI file
+    - resets live run json/csv logs
+    - reapplies detection state after restart
     """
     with _live_video_restart_lock:
         if cam_id in _live_video_restart_pending:
@@ -1800,104 +1845,187 @@ def restart_single_live_camera(cam_id: str) -> bool:
     try:
         _system(f"LIVE: Attempting to restart {cam_id}")
 
-        # Get current detection state before restart
+        # ---------------------------------
+        # 1) remember current detection state
+        # ---------------------------------
         detection_config = load_detection_config()
-        detection_enabled = detection_config.get(cam_id, True)
+        detection_enabled = bool(detection_config.get(cam_id, True))
 
-        # Stop the current pipeline
-        p = pipelines_live.get(cam_id)
-        if p:
+        # ---------------------------------
+        # 2) stop old pipeline if exists
+        # ---------------------------------
+        old_p = pipelines_live.get(cam_id)
+        if old_p:
             try:
-                if hasattr(p, 'stop'):
-                    p.stop()
+                if hasattr(old_p, "stop"):
+                    old_p.stop()
                 _system(f"LIVE: Stopped pipeline for {cam_id}")
             except Exception as e:
-                _system(f"Error stopping pipeline for {cam_id}: {e}")
+                _system(f"LIVE: Error stopping pipeline for {cam_id}: {e}")
 
-        # ✅ get_live_source() returns RTSP URL if configured, else upload file path string
+        try:
+            pipelines_live.pop(cam_id, None)
+        except Exception:
+            pass
+
+        # ---------------------------------
+        # 3) resolve source
+        # ---------------------------------
         src = get_live_source(cam_id)
         if not src:
             _system(f"LIVE: Source not found for {cam_id}, cannot restart")
             return False
 
-        # ✅ Only call .exists() for file paths — RTSP URLs cannot be stat'd
-        is_rtsp = src.startswith("rtsp://") or src.startswith("rtsps://")
-        if not is_rtsp and not Path(src).exists():
+        is_rtsp = str(src).startswith("rtsp://") or str(src).startswith("rtsps://")
+
+        if (not is_rtsp) and (not Path(src).exists()):
             _system(f"LIVE: File source does not exist for {cam_id}: {src}")
             return False
 
-        try:
-            from video_pipeline import PipelineConfig, VideoPipeline
+        from video_pipeline import PipelineConfig, VideoPipeline
 
-            # Get ROI path
-            roi_path = _ensure_roi_file("live", cam_id)
+        # ---------------------------------
+        # 4) prepare common paths
+        # ---------------------------------
+        roi_path = _ensure_roi_file("live", cam_id)
+        _reset_live_run_files(cam_id)
 
-            # Reset run files (clear logs but keep ROI)
-            _reset_live_run_files(cam_id)
+        forced_video_type = None
+        source_kind = "RTSP" if is_rtsp else "FILE"
 
-            # ✅ src is a plain string — PipelineConfig.src accepts both file paths and rtsp:// URLs
-            forced_video_type = None
-            source_kind = "FILE"
+        # ---------------------------------
+        # 5) branch: RTSP
+        # ---------------------------------
+        if is_rtsp:
+            try:
+                rtsp_store = load_rtsp_sources() or {}
+                rec = _rtsp_store_get(rtsp_store, cam_id)
 
-            if is_rtsp:
-                source_kind = "RTSP"
-                try:
-                    rtsp_store = load_rtsp_sources() or {}
-                    rec = _rtsp_store_get(rtsp_store, cam_id)
-                    if isinstance(rec, dict):
-                        vt = str(rec.get("video_type") or rec.get("type") or "auto").strip().lower()
-                        if vt == "auto":
-                            vt = detect_rtsp_video_type(cam_id, src)
-                        if vt in ("normal", "fisheye"):
-                            forced_video_type = vt
-                except Exception:
-                    pass
+                vt = None
+                if isinstance(rec, dict):
+                    vt = str(rec.get("video_type") or rec.get("type") or "auto").strip().lower()
+
+                if not vt or vt == "auto":
+                    vt = detect_rtsp_video_type(cam_id, src)
+
+                if vt not in ("normal", "fisheye"):
+                    vt = "normal"
+
+                forced_video_type = vt
+            except Exception as e:
+                _system(f"LIVE: RTSP type resolve failed for {cam_id}: {e}")
+                forced_video_type = "normal"
 
             cfg = PipelineConfig(
                 camera_id=cam_id,
                 src=src,
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=3,
-                desired_fps_fisheye=3.0,
-                desired_fps_normal=3.0,
+                max_skip=1.0,
+
+                desired_fps_fisheye=2.0,
+                desired_fps_normal=2.0,
+
                 window_scale=0.80,
-                display_fps=10.0,
+                display_fps=4.0,
                 show_ui=False,
                 enable_detection=detection_enabled,
                 force_video_type=forced_video_type,
-                source_kind=source_kind,
+                source_kind="RTSP",
+
+                base_frame_skip_fisheye_rtsp=0,
+                base_frame_skip_normal_rtsp=0,
+
+                base_frame_skip_fisheye_file=0,
+                base_frame_skip_normal_file=0,
+
+                drop_old_detection_jobs=False,
+                latest_only_tracking=False,
             )
 
-            detector = _get_live_detector() if detection_enabled else object()
+        # ---------------------------------
+        # 6) branch: upload/file
+        # ---------------------------------
+        else:
+            try:
+                forced_video_type = detect_video_type_cached(cam_id, Path(src), force_refresh=False)
+            except Exception as e:
+                _system(f"LIVE: FILE type resolve failed for {cam_id}: {e}")
+                forced_video_type = None
 
-            new_pipeline = VideoPipeline(cfg, detector)
-            if new_pipeline.start():
-                pipelines_live[cam_id] = new_pipeline
-                _system(f"LIVE: Successfully restarted {cam_id} (detection={detection_enabled}, src={src})")
+            cfg = PipelineConfig(
+                camera_id=cam_id,
+                src=src,
+                roi_config_path=str(roi_path),
+                num_workers=1,
+                max_skip=1.0,
 
-                # Mark ROI as dirty to ensure it's reloaded
-                try:
-                    setattr(new_pipeline, "_roi_dirty", True)
-                    if hasattr(new_pipeline, "reload_roi"):
-                        new_pipeline.reload_roi()
-                except Exception:
-                    pass
+                desired_fps_fisheye=3.0,
+                desired_fps_normal=3.0,
 
-                return True
-            else:
-                _system(f"LIVE: Failed to start new pipeline for {cam_id}")
-                return False
+                window_scale=0.80,
+                display_fps=12.0,
+                show_ui=False,
+                enable_detection=detection_enabled,
+                force_video_type=forced_video_type,
+                source_kind="FILE",
 
-        except Exception as e:
-            _system(f"LIVE: Error creating new pipeline for {cam_id}: {e}")
-            traceback.print_exc()
+                base_frame_skip_fisheye_rtsp=0,
+                base_frame_skip_normal_rtsp=0,
+
+                base_frame_skip_fisheye_file=0,
+                base_frame_skip_normal_file=0,
+
+                drop_old_detection_jobs=False,
+                latest_only_tracking=False,
+            )
+
+        # ---------------------------------
+        # 7) start new pipeline
+        # ---------------------------------
+        detector = _get_live_detector()
+        new_pipeline = VideoPipeline(cfg, detector)
+
+        if not new_pipeline.start():
+            _system(f"LIVE: Failed to start new pipeline for {cam_id}")
             return False
+
+        pipelines_live[cam_id] = new_pipeline
+
+        # ---------------------------------
+        # 8) re-apply ROI + detection state
+        # ---------------------------------
+        try:
+            setattr(new_pipeline, "_roi_dirty", True)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(new_pipeline, "reload_roi"):
+                new_pipeline.reload_roi()
+        except Exception as e:
+            _system(f"LIVE: ROI reload failed for {cam_id}: {e}")
+
+        try:
+            if hasattr(new_pipeline, "set_detection_enabled"):
+                new_pipeline.set_detection_enabled(detection_enabled)
+        except Exception as e:
+            _system(f"LIVE: detection state reapply failed for {cam_id}: {e}")
+
+        _system(
+            f"LIVE: Successfully restarted {cam_id} "
+            f"(src={src}, source_kind={source_kind}, type={forced_video_type}, detection={detection_enabled})"
+        )
+        return True
+
+    except Exception as e:
+        _system(f"LIVE: Error creating new pipeline for {cam_id}: {e}")
+        traceback.print_exc()
+        return False
 
     finally:
         with _live_video_restart_lock:
             _live_video_restart_pending.discard(cam_id)
-
 
 def monitor_live_videos_loop():
     """
@@ -2040,15 +2168,21 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 src=str(f),
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=3,
+                max_skip=1.0,
+
                 desired_fps_fisheye=3.0,
                 desired_fps_normal=3.0,
                 window_scale=0.80,
-                display_fps=10.0,
+                display_fps=12.0,
+
                 show_ui=False,
                 enable_detection=True,
                 force_video_type=None,
                 source_kind="FILE",
+
+                # IMPORTANT: keep upload/file light but not too aggressive
+                base_frame_skip_fisheye_file=0,
+                base_frame_skip_normal_file=0,
             )
 
             p = VideoPipeline(cfg, detector)
@@ -2074,25 +2208,27 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 src=rec["url"],
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=3,
+                max_skip=1.0,
+
                 desired_fps_fisheye=2.0,
-                desired_fps_normal=3.0,
+                desired_fps_normal=2.0,
+
                 window_scale=0.80,
-                display_fps=10.0,
+                display_fps=4.0,
                 show_ui=False,
                 enable_detection=True,
-                # ✅ VERY IMPORTANT:
-                force_video_type=rec["video_type"],  # "normal" | "fisheye"
+                force_video_type=rec["video_type"],
                 source_kind="RTSP",
-                base_frame_skip_fisheye_rtsp=6,
-                base_frame_skip_normal_rtsp=6,
-                base_frame_skip_fisheye_file=4,
-                base_frame_skip_normal_file=4,
 
-                drop_old_detection_jobs=True,
-                latest_only_tracking=True,
+                base_frame_skip_fisheye_rtsp=0,
+                base_frame_skip_normal_rtsp=0,
+
+                base_frame_skip_fisheye_file=1,
+                base_frame_skip_normal_file=1,
+
+                drop_old_detection_jobs=False,
+                latest_only_tracking=False,
             )
-
             p = VideoPipeline(cfg, detector)
             if not p.start():
                 _system(f"LIVE: pipeline start failed cam_id={cam_id} (RTSP)")
@@ -3027,6 +3163,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://qy248.github.io",
         "https://jinxuan-wong.github.io",
+        "https://c9e92d69.securewatch.pages.dev",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -3065,21 +3202,14 @@ def render_health():
 
 
 @app.get("/api/lostfound/alerts")
-def lostfound_alerts(limit: int = 50):
+def lostfound_alerts(request: Request, limit: int = 50):
     lim = max(1, min(int(limit or 50), 200))
 
     overrides = _read_overrides()
 
-    with _items_store_lock:
-        if ITEMS_STORE_PATH.exists():
-            try:
-                store = json.loads(ITEMS_STORE_PATH.read_text(encoding="utf-8"))
-                if not isinstance(store, dict):
-                    store = {}
-            except Exception:
-                store = {}
-        else:
-            store = {}
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
 
     items = []
     for _, it in store.items():
@@ -3104,7 +3234,9 @@ def lostfound_alerts(limit: int = 50):
     items.sort(key=_ts, reverse=True)
     items = items[:lim]
 
+    base = str(request.base_url).rstrip("/")
     out = []
+
     for it in items:
         iid = str(it.get("id") or "")
         cam_id = str(it.get("cameraId") or it.get("videoId") or it.get("source") or "")
@@ -3113,20 +3245,37 @@ def lostfound_alerts(limit: int = 50):
         label = str(it.get("label") or "item")
         loc = str(it.get("location") or cam_id or "unknown location")
 
-        ts = _ts(it)  # seconds epoch
+        ts = _ts(it)
         severity = "medium"
         if label.lower() in ("wallet", "mobile_phone", "laptop", "tablet"):
             severity = "high"
 
-        # ✅ IMPORTANT: provide image url for dashboard thumbnails
-        img = (
+        snap = (
+            it.get("snapshot")
+            or it.get("snapshot_path")
+            or it.get("image_path")
+            or None
+        )
+
+        # IMPORTANT:
+        # rebuild fresh URL from local snapshot path first
+        img = None
+        if snap:
+            try:
+                img = to_image_url(str(snap), base)
+            except Exception:
+                img = None
+
+        # fallback only if no snapshot-based url available
+        if not img:
+            img = (
                 it.get("imageUrl")
                 or it.get("thumbUrl")
                 or it.get("evidence_url")
                 or it.get("snapshot_url")
-                or it.get("snapshot")
                 or None
-        )
+            )
+
         if img is not None:
             img = str(img)
 
@@ -3139,7 +3288,6 @@ def lostfound_alerts(limit: int = 50):
                 "timestamp": ts,
                 "severity": severity,
                 "message": f"Lost item detected: {label} ({loc})",
-                # ✅ add these fields
                 "imageUrl": img,
                 "thumbUrl": img,
             }
@@ -3150,40 +3298,28 @@ def lostfound_alerts(limit: int = 50):
 
 @app.post("/api/lostfound/alerts/{alert_id}/dismiss")
 def dismiss_lostfound_alert(alert_id: str):
-    with _items_store_lock:
-        if ITEMS_STORE_PATH.exists():
-            try:
-                store = json.loads(ITEMS_STORE_PATH.read_text(encoding="utf-8"))
-                if not isinstance(store, dict):
-                    store = {}
-            except Exception:
-                store = {}
-        else:
-            store = {}
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
 
-        found = False
+    found = False
 
-        for key, it in store.items():
-            if not isinstance(it, dict):
-                continue
+    for key, it in store.items():
+        if not isinstance(it, dict):
+            continue
 
-            iid = str(it.get("id") or "")
-            if iid == str(alert_id):
-                it["deleted"] = True
-                store[key] = it
-                found = True
-                break
+        iid = str(it.get("id") or "")
+        if iid == str(alert_id):
+            it["deleted"] = True
+            store[key] = it
+            found = True
+            break
 
-        if not found:
-            raise HTTPException(status_code=404, detail="Alert not found")
+    if not found:
+        raise HTTPException(status_code=404, detail="Alert not found")
 
-        ITEMS_STORE_PATH.write_text(
-            json.dumps(store, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-
+    _write_items_store(store)
     return {"ok": True, "id": alert_id}
-
 
 # ---------- settings ----------
 @app.get("/api/lostfound/settings")
@@ -3219,21 +3355,32 @@ def clear_all_lostfound_events() -> Dict[str, Any]:
 
     try:
         with _items_store_lock:
-            if ITEMS_STORE_PATH.exists():
-                ITEMS_STORE_PATH.write_text("[]", encoding="utf-8")
+            _lf_rewrite_all_shards(
+                LF_STORE_ITEMS_DIR,
+                LF_STORE_ITEMS_PREFIX,
+                {},
+                LF_ITEMS_PER_FILE,
+            )
 
         with _overrides_lock:
-            if OVERRIDES_PATH.exists():
-                OVERRIDES_PATH.write_text("[]", encoding="utf-8")
+            _lf_rewrite_all_shards(
+                LF_STORE_OVERRIDES_DIR,
+                LF_STORE_OVERRIDES_PREFIX,
+                {},
+                LF_OVERRIDES_PER_FILE,
+            )
 
-        for base_dir in [OUTPUTS_LF_DIR, PROJECT_OUTPUTS_LF_DIR, SNAPSHOT_DIR]:
+        for base_dir in [OUTPUTS_LF_DIR, PROJECT_OUTPUTS_LF_DIR]:
             if not base_dir.exists():
                 continue
+
             for p in base_dir.rglob("*"):
                 if not p.is_file():
                     continue
-                if p.name in {"roi_config.json", "_settings.json"}:
+
+                if not _is_safe_lf_event_file(p):
                     continue
+
                 try:
                     p.unlink(missing_ok=True)
                     removed_files += 1
@@ -3580,7 +3727,15 @@ def live_frame(cam_id: str, view_idx: int):
     # -----------------------------
     # 2) FALLBACK (slow method) — supports both file path and rtsp://
     # -----------------------------
-    if not focus_is(page="live", active_id=cam_id) and not focus_is(page="dashboard", active_id=cam_id):
+    src = get_live_source(cam_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="live source not found")
+
+    is_rtsp = src.startswith("rtsp://") or src.startswith("rtsps://")
+
+    # For RTSP, allow fallback even if focus state is not perfect.
+    # Dashboard often needs fallback when cache is not ready yet.
+    if (not is_rtsp) and (not focus_is(page="live", active_id=cam_id)) and (not focus_is(page="dashboard", active_id=cam_id)):
         raise HTTPException(status_code=404, detail="not focused (skip slow fallback)")
 
     src = get_live_source(cam_id)
@@ -4636,28 +4791,108 @@ app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshot
 # ============================================================
 # Lost & Found UI Overrides (status/notes/delete) - persistent
 # ============================================================
-OVERRIDES_PATH = OUTPUTS_LF_DIR / "_overrides.json"
 _overrides_lock = threading.Lock()
-ITEMS_STORE_PATH = OUTPUTS_LF_DIR / "_items_store.json"
 _items_store_lock = threading.Lock()
 
+LF_STORE_ITEMS_DIR = OUTPUTS_LF_DIR / "_items_store"
+LF_STORE_OVERRIDES_DIR = OUTPUTS_LF_DIR / "_overrides_store"
+
+LF_STORE_ITEMS_DIR.mkdir(parents=True, exist_ok=True)
+LF_STORE_OVERRIDES_DIR.mkdir(parents=True, exist_ok=True)
+
+LF_STORE_ITEMS_PREFIX = "items_"
+LF_STORE_OVERRIDES_PREFIX = "overrides_"
+LF_STORE_SUFFIX = ".json"
+
+LF_ITEMS_PER_FILE = 300
+LF_OVERRIDES_PER_FILE = 300
+
+def _lf_shard_path(root: Path, prefix: str, index: int) -> Path:
+    return root / f"{prefix}{index:06d}{LF_STORE_SUFFIX}"
+
+def _lf_list_shard_paths(root: Path, prefix: str) -> List[Path]:
+    return sorted(root.glob(f"{prefix}*{LF_STORE_SUFFIX}"))
+
+def _lf_load_shard(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _lf_save_shard(path: Path, data: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception:
+        pass
+
+def _lf_load_all_shards(root: Path, prefix: str) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for p in _lf_list_shard_paths(root, prefix):
+        shard = _lf_load_shard(p)
+        if isinstance(shard, dict):
+            merged.update(shard)
+    return merged
+
+def _lf_rewrite_all_shards(
+    root: Path,
+    prefix: str,
+    data: Dict[str, Any],
+    per_file: int,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+
+    for p in _lf_list_shard_paths(root, prefix):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    items = list((data or {}).items())
+    if not items:
+        _lf_save_shard(_lf_shard_path(root, prefix, 1), {})
+        return
+
+    shard_idx = 1
+    for i in range(0, len(items), per_file):
+        chunk = dict(items[i:i + per_file])
+        _lf_save_shard(_lf_shard_path(root, prefix, shard_idx), chunk)
+        shard_idx += 1
 
 def _read_overrides() -> Dict[str, Dict[str, Any]]:
     with _overrides_lock:
-        if not OVERRIDES_PATH.exists():
-            return {}
-        try:
-            data = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-
+        data = _lf_load_all_shards(LF_STORE_OVERRIDES_DIR, LF_STORE_OVERRIDES_PREFIX)
+        return data if isinstance(data, dict) else {}
 
 def _write_overrides(data: Dict[str, Dict[str, Any]]) -> None:
     with _overrides_lock:
-        OVERRIDES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OVERRIDES_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        clean = data if isinstance(data, dict) else {}
+        _lf_rewrite_all_shards(
+            LF_STORE_OVERRIDES_DIR,
+            LF_STORE_OVERRIDES_PREFIX,
+            clean,
+            LF_OVERRIDES_PER_FILE,
+        )
 
+def _read_items_store() -> Dict[str, Dict[str, Any]]:
+    with _items_store_lock:
+        data = _lf_load_all_shards(LF_STORE_ITEMS_DIR, LF_STORE_ITEMS_PREFIX)
+        return data if isinstance(data, dict) else {}
+
+def _write_items_store(data: Dict[str, Dict[str, Any]]) -> None:
+    with _items_store_lock:
+        clean = data if isinstance(data, dict) else {}
+        _lf_rewrite_all_shards(
+            LF_STORE_ITEMS_DIR,
+            LF_STORE_ITEMS_PREFIX,
+            clean,
+            LF_ITEMS_PER_FILE,
+        )
 
 def _apply_override(item: Dict[str, Any], overrides: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(item, dict):
@@ -4673,17 +4908,20 @@ def _apply_override(item: Dict[str, Any], overrides: Dict[str, Dict[str, Any]]) 
 
     if isinstance(ov.get("status"), str) and ov["status"] in ("lost", "solved"):
         item["status"] = ov["status"]
+
     if isinstance(ov.get("notes"), str):
         item["notes"] = ov["notes"]
+
     if isinstance(ov.get("updated_at"), (int, float)):
         item["updatedAt"] = int(ov["updated_at"])
 
-    # ✅ ADD THIS
     if isinstance(ov.get("deleted"), bool):
         item["deleted"] = ov["deleted"]
 
-    return item
+    if not item.get("snapshot") and isinstance(ov.get("snapshot"), str):
+        item["snapshot"] = ov["snapshot"]
 
+    return item
 
 @app.get("/api/lostfound/items")
 def api_lostfound_items(request: Request):
@@ -4691,22 +4929,16 @@ def api_lostfound_items(request: Request):
 
     overrides = _read_overrides()
 
-    # ✅ NEW: persistent history store (NO new helper functions)
-    with _items_store_lock:
-        if ITEMS_STORE_PATH.exists():
-            try:
-                store = json.loads(ITEMS_STORE_PATH.read_text(encoding="utf-8"))
-                if not isinstance(store, dict):
-                    store = {}
-            except Exception:
-                store = {}
-        else:
-            store = {}
+    # persistent history store
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
 
     def _store_merge(item: Dict[str, Any]) -> None:
-        """inline merge (no new function outside)"""
+        """inline merge (no new helper functions outside)"""
         if not isinstance(item, dict):
             return
+
         iid = str(item.get("id") or "").strip()
         if not iid:
             return
@@ -4718,17 +4950,30 @@ def api_lostfound_items(request: Request):
         if merged.get("firstSeenTs") is None and item.get("firstSeenTs") is not None:
             merged["firstSeenTs"] = item.get("firstSeenTs")
 
-        # always update latest fields
         for k in (
-                "lastSeenTs", "module", "source", "cameraId", "videoId", "location",
-                "label", "status", "imageUrl", "raw", "notes", "updatedAt"
+            "lastSeenTs",
+            "module",
+            "source",
+            "cameraId",
+            "videoId",
+            "location",
+            "label",
+            "status",
+            "imageUrl",
+            "snapshot",
+            "snapshot_path",
+            "image_path",
+            "raw",
+            "notes",
+            "updatedAt",
         ):
             if k in item and item[k] is not None:
                 merged[k] = item[k]
+                
 
         store[iid] = merged
 
-    # -------------------------
+   # -------------------------
     # 1) LIVE items (pipelines)
     # -------------------------
     try:
@@ -4748,14 +4993,19 @@ def api_lostfound_items(request: Request):
                 norm = _normalize_live_item(cam_id, it, base)
                 norm["id"] = str(norm.get("id") or "")
 
-                # ✅ IMPORTANT: always use outputs mapping (do NOT force /snapshots/{cam_id}/...)
-                # If your snapshot_path is already inside OUTPUTS_LF_DIR, to_image_url works.
+                # ✅ IMPORTANT: save snapshot fields for LIVE too
                 snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
                 if snap:
+                    snap = str(snap)
+                    norm["snapshot"] = snap
+                    norm["snapshot_path"] = snap
+                    norm["image_path"] = snap
                     try:
-                        norm["imageUrl"] = to_image_url(str(snap), base)
+                        norm["imageUrl"] = to_image_url(snap, base)
                     except Exception:
-                        pass
+                        norm["imageUrl"] = None
+                else:
+                    norm["imageUrl"] = None
 
                 norm = _apply_override(norm, overrides)
 
@@ -4764,8 +5014,6 @@ def api_lostfound_items(request: Request):
 
     except Exception:
         pass
-
-    # -------------------------
     # 2) OFFLINE analyzed items
     # -------------------------
     try:
@@ -4798,36 +5046,74 @@ def api_lostfound_items(request: Request):
                 norm = _normalize_offline_item(stem, it, base)
                 norm["id"] = str(norm.get("id") or "")
 
+                snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+                if snap:
+                    snap = str(snap)
+                    norm["snapshot"] = snap
+                    norm["snapshot_path"] = snap
+                    norm["image_path"] = snap
+                    try:
+                        norm["imageUrl"] = to_image_url(snap, base)
+                    except Exception:
+                        norm["imageUrl"] = None
+                else:
+                    norm["imageUrl"] = None
+
                 norm = _apply_override(norm, overrides)
 
-                # ✅ store history
+                # store history
                 _store_merge(norm)
 
     except Exception:
         pass
 
-    # ✅ persist store back to disk
-    with _items_store_lock:
-        try:
-            ITEMS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            ITEMS_STORE_PATH.write_text(json.dumps(store, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    # persist store back to disk
+    try:
+        _write_items_store(store)
+    except Exception:
+        pass
 
     # -------------------------
     # 3) Build response from STORE (history)
     # -------------------------
     unique: List[dict] = []
+
     for iid, it in (store or {}).items():
         if not isinstance(it, dict):
             continue
+
         item = dict(it)
         item["id"] = str(iid)
 
-        # apply override again to ensure latest delete/solve/notes reflect immediately
         item = _apply_override(item, overrides)
 
-        # ✅ hide deleted
+        snap = (
+            item.get("snapshot")
+            or item.get("snapshot_path")
+            or item.get("image_path")
+        )
+
+        # Always rebuild imageUrl from snapshot path
+        if snap:
+            try:
+                item["imageUrl"] = to_image_url(str(snap), base)
+            except Exception:
+                item["imageUrl"] = None
+        else:
+            item["imageUrl"] = None
+
+        # Optional safety: if file no longer exists, clear imageUrl
+        if snap:
+            try:
+                snap_path = Path(str(snap))
+                if not snap_path.is_absolute():
+                    snap_path = (OUTPUTS_LF_DIR / snap_path).resolve()
+
+                if not snap_path.exists():
+                    item["imageUrl"] = None
+            except Exception:
+                item["imageUrl"] = None
+
         if item.get("deleted") is True:
             continue
 
@@ -4844,7 +5130,6 @@ def api_lostfound_items(request: Request):
 
     unique.sort(key=_sort_key, reverse=True)
     return JSONResponse({"items": unique})
-
 
 # ============================================================
 # Lost & Found Item Actions (Solve / Update Notes / Delete)
@@ -4902,7 +5187,14 @@ def persist_live_items_on_shutdown():
     print("Persisting live lost items before shutdown...")
 
     overrides = _read_overrides()
-    base = "http://localhost"  # not used for UI rendering here
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
+
+    # IMPORTANT:
+    # Do NOT use "http://localhost" here because after restart/frontend access
+    # the base URL may be different.
+    base = ""
 
     for cam_id, p in list(pipelines.items()):
         try:
@@ -4920,25 +5212,54 @@ def persist_live_items_on_shutdown():
                 if not iid:
                     continue
 
-                rec = overrides.get(iid) or {}
+                prev = store.get(iid) if isinstance(store.get(iid), dict) else {}
+                merged = dict(prev)
 
-                # Copy important fields
+                if merged.get("firstSeenTs") is None and norm.get("firstSeenTs") is not None:
+                    merged["firstSeenTs"] = norm.get("firstSeenTs")
+
+                # IMPORTANT:
+                # Do NOT persist imageUrl because it may become stale after restart.
+                for k in (
+                    "lastSeenTs",
+                    "module",
+                    "source",
+                    "cameraId",
+                    "videoId",
+                    "location",
+                    "label",
+                    "status",
+                    "raw",
+                    "notes",
+                    "updatedAt",
+                ):
+                    if k in norm and norm[k] is not None:
+                        merged[k] = norm[k]
+
+                snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+                if snap:
+                    merged["snapshot"] = str(snap)
+
+                # remove any old stale imageUrl
+                merged.pop("imageUrl", None)
+
+                store[iid] = merged
+
+                rec = overrides.get(iid) or {}
                 rec["status"] = norm.get("status", "lost")
                 rec["notes"] = rec.get("notes", "")
                 rec["updated_at"] = int(time.time())
-
-                # Optional: store full snapshot path for recovery
-                rec["snapshot"] = norm.get("raw", {}).get("snapshot_path")
-
+                if snap:
+                    rec["snapshot"] = str(snap)
                 overrides[iid] = rec
 
             except Exception:
                 continue
 
+    _write_items_store(store)
     _write_overrides(overrides)
 
     print("Live lost items persisted successfully.")
-
 
 # ============================================================
 # SETTINGS STATIC ROI FRAMES (frozen snapshots)
@@ -4950,31 +5271,63 @@ _static_group_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (cam_id, grou
 
 def _allowed_live_cam_ids(*, only_enabled: bool = False) -> Set[str]:
     """
-    Returns cam_ids that are actually used by Live View.
+    Returns cam_ids used by Live View / Settings page.
+
+    Upload:
+    - source of truth = upload folder + _cameras_enabled.json
+
+    RTSP:
+    - source of truth = pipelines_live, and if only_enabled=True,
+      also respect rtsp_sources.json enabled flag
     """
     allowed: Set[str] = set()
 
-    # 1) From running live pipelines (most accurate for your system)
+    # -------------------------------------------------
+    # 1) Upload cameras from upload folder
+    # -------------------------------------------------
     try:
-        for cid in (pipelines_live or {}).keys():
-            cid2 = _base_id(str(cid)).strip()
-            if cid2:
-                allowed.add(cid2)
+        upload_enabled = load_cameras_enabled() or {}
+        files = list_upload_videos_h264_only()
+
+        for f in files:
+            cid = _upload_cam_id_from_file(f)
+            if not cid:
+                continue
+
+            if only_enabled:
+                if bool(upload_enabled.get(cid, True)):
+                    allowed.add(cid)
+            else:
+                allowed.add(cid)
     except Exception:
         pass
 
-    # 2) Optional: filter only those that are enabled (ON) in settings
-    if only_enabled:
-        try:
-            st = load_lf_settings() or {}
-            enabled = st.get("cameras_enabled") or {}
-            allowed = {cid for cid in allowed if bool(enabled.get(cid, True))}
-        except Exception:
-            pass
+    # -------------------------------------------------
+    # 2) RTSP cameras from running live pipelines
+    # -------------------------------------------------
+    try:
+        rtsp_store = load_rtsp_sources() or {}
+
+        for cid in (pipelines_live or {}).keys():
+            cid2 = str(_base_id(cid)).strip()
+            if not cid2:
+                continue
+
+            if str(cid2).startswith("rtsp_"):
+                if only_enabled:
+                    rec = rtsp_store.get(cid2) or {}
+                    if bool(rec.get("enabled", True)):
+                        allowed.add(cid2)
+                else:
+                    allowed.add(cid2)
+            else:
+                # upload pipeline ids already handled from upload folder
+                if not only_enabled:
+                    allowed.add(cid2)
+    except Exception:
+        pass
 
     return allowed
-
-
 @app.get("/api/lostfound/cameras_for_settings")
 def get_lostfound_cameras_for_settings(request: Request, start: str = "A"):
     """
@@ -4993,7 +5346,7 @@ def get_lostfound_cameras_for_settings(request: Request, start: str = "A"):
     if start not in ("A", "B"):
         start = "A"
 
-    allowed_live = _allowed_live_cam_ids(only_enabled=False)
+    allowed_live = _allowed_live_cam_ids(only_enabled=True)
 
     # =========================================================
     # 1) Uploaded videos
@@ -5806,7 +6159,7 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
 
     overlay = 1 if int(overlay) == 1 else 0
 
-    FPS = 2.0
+    FPS = 4.0
     FRAME_DT = 1.0 / FPS
     STALE_OK_SEC = 2.0
 
@@ -6529,11 +6882,6 @@ def get_upload_sources_for_settings(request: Request):
 
 @app.post("/api/lostfound/cameras_enabled/toggle/{cam_id}")
 def toggle_camera_enabled_api(cam_id: str, payload: Dict[str, Any] = Body(...)):
-    """
-    ✅ IMPORTANT:
-    Use _base_id here (NOT _live_id), otherwise it creates a different key
-    and causes duplicates like 'B001G-399...' vs long id.
-    """
     cam_id = str(_base_id(cam_id)).strip()
 
     data = load_cameras_enabled()
@@ -6541,12 +6889,23 @@ def toggle_camera_enabled_api(cam_id: str, payload: Dict[str, Any] = Body(...)):
     data[cam_id] = enabled
     save_cameras_enabled(data)
 
-    # ✅ IMMEDIATE APPLY
     if enabled:
+        ok = False
         try:
-            restart_single_live_camera(cam_id)
+            ok = restart_single_live_camera(cam_id)
+        except Exception:
+            ok = False
+
+        # force detection re-apply after restart
+        try:
+            p = pipelines_live.get(cam_id)
+            if p and hasattr(p, "set_detection_enabled"):
+                det_cfg = load_detection_config()
+                p.set_detection_enabled(bool(det_cfg.get(cam_id, True)))
         except Exception:
             pass
+
+        return {"ok": ok, "cam_id": cam_id, "enabled": enabled}
     else:
         p = pipelines_live.get(cam_id)
         if p and hasattr(p, "stop"):
@@ -6555,8 +6914,7 @@ def toggle_camera_enabled_api(cam_id: str, payload: Dict[str, Any] = Body(...)):
             except Exception:
                 pass
         pipelines_live.pop(cam_id, None)
-
-    return {"ok": True, "cam_id": cam_id, "enabled": enabled}
+        return {"ok": True, "cam_id": cam_id, "enabled": enabled}
 
 
 # ============================================================
@@ -7644,3 +8002,5 @@ def set_live_view_mode_overrides(payload: dict = Body(...)):
         ok = _save_view_mode_overrides(cleaned)
 
     return {"ok": ok, "count": len(cleaned), "overrides": cleaned}
+
+
