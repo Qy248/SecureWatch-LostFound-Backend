@@ -3086,7 +3086,7 @@ async def lifespan(app: FastAPI):
         """Start live pipelines and monitoring"""
         try:
             _system("Startup: starting LIVE pipelines (detection)...")
-            start_live_pipelines(limit_normal=999, limit_fisheye=999)
+            start_live_pipelines(limit_normal=8, limit_fisheye=4)
 
             # Initialize detection config from pipelines
             init_detection_config_from_pipelines()
@@ -4370,7 +4370,7 @@ def restart_live(target_cam_id: str = None):
         pipelines_settings = {}
 
         # Start fresh
-        start_live_pipelines(limit_normal=999, limit_fisheye=999)
+        start_live_pipelines(limit_normal=8, limit_fisheye=4)
 
         # Reset restart counters for all cameras
         with _live_video_monitor_lock:

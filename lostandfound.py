@@ -2901,6 +2901,7 @@ class YoloDetector:
         "headphone",
         "charger_adapter",
         "spectacles",
+        "usb_drive",
     }
 
     @staticmethod
