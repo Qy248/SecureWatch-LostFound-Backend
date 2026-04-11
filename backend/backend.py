@@ -5347,26 +5347,29 @@ def api_lostfound_items(request: Request):
             or item.get("image_path")
         )
 
-        # Always rebuild imageUrl from snapshot path
+        image_url = None
+
         if snap:
             try:
-                item["imageUrl"] = to_image_url(str(snap), base)
-            except Exception:
-                item["imageUrl"] = None
-        else:
-            item["imageUrl"] = None
+                snap_str = str(snap).strip()
+                if snap_str:
+                    item["snapshot"] = snap_str
+                    item["snapshot_path"] = snap_str
+                    item["image_path"] = snap_str
 
-        # Optional safety: if file no longer exists, clear imageUrl
-        if snap:
-            try:
-                snap_path = Path(str(snap))
-                if not snap_path.is_absolute():
-                    snap_path = (OUTPUTS_LF_DIR / snap_path).resolve()
+                    snap_path = Path(snap_str)
+                    if not snap_path.is_absolute():
+                        snap_path = (OUTPUTS_LF_DIR / snap_path).resolve()
 
-                if not snap_path.exists():
-                    item["imageUrl"] = None
+                    if snap_path.exists():
+                        try:
+                            image_url = to_image_url(str(snap_path), base)
+                        except Exception:
+                            image_url = None
             except Exception:
-                item["imageUrl"] = None
+                image_url = None
+
+        item["imageUrl"] = image_url
 
         if item.get("deleted") is True:
             continue
