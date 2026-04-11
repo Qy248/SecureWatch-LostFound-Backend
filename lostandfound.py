@@ -78,34 +78,6 @@ LF_ROI_MODE = os.getenv("LF_ROI_MODE", "auto").strip().lower()
 # If backend runs headless, default to safe behavior: auto-reuse ROI (no prompt)
 if LF_HEADLESS and LF_ROI_MODE not in ("auto", "reuse", "redraw"):
     LF_ROI_MODE = "auto"
-
-def _roi_is_empty_cfg(roi: dict) -> bool:
-    """Return True if ROI dict has no polygons at all."""
-    if not isinstance(roi, dict):
-        return True
-    b = roi.get("bounding_polygons") or []
-    fis = roi.get("fisheye_polygons") or {}
-    a = (fis.get("A") or {}) if isinstance(fis, dict) else {}
-    bb = (fis.get("B") or {}) if isinstance(fis, dict) else {}
-    # any fisheye polygon exists?
-    def any_polys(group_obj: dict) -> bool:
-        for k, v in (group_obj or {}).items():
-            if isinstance(v, list) and len(v) > 0:
-                return True
-        return False
-    return (len(b) == 0) and (not any_polys(a)) and (not any_polys(bb))
-
-def _load_roi_or_none(roi_path) -> dict | None:
-    try:
-        if not roi_path.exists():
-            return None
-        import json
-        roi = json.loads(roi_path.read_text(encoding="utf-8"))
-        if _roi_is_empty_cfg(roi):
-            return None
-        return roi
-    except Exception:
-        return None
 # ============================================================
 # Fisheye mode (manual / auto_toggle / both)
 # ============================================================
@@ -1339,97 +1311,6 @@ def dedup_by_overlap_ratio(detections, overlap_thr=0.50):
             kept.append(d)
 
     return kept
-
-
-# ---------------------------------------------------------
-# Tracking Configuration
-# ---------------------------------------------------------
-def keep_one_per_track(dets):
-    """
-    For each track_id keep the highest-confidence detection.
-    Also keep detections with no track_id.
-    """
-    best = {}
-    no_tid = []
-    for d in dets or []:
-        tid = d.get("track_id", None)
-        if tid is None:
-            no_tid.append(d)
-            continue
-
-        score = float(d.get("confidence", 0.0))
-        if tid not in best or score > float(best[tid].get("confidence", 0.0)):
-            best[tid] = d
-
-    return list(best.values()) + no_tid
-
-def build_tracked_objects(tracks, detections):
-    """
-    Output format for Phrase 6:
-      [{"track_id": int, "class_name": str, "bbox": [x1,y1,x2,y2], "confidence": float}, ...]
-    """
-    tracked_objects = []
-
-    # ---- A) Prefer DeepSORT tracks if they contain class info ----
-    if tracks:
-        for trk in tracks:
-            # deep_sort_realtime Track API differences (safe getattr)
-            if hasattr(trk, "is_confirmed") and not trk.is_confirmed():
-                continue
-
-            tid = getattr(trk, "track_id", None)
-            if tid is None:
-                continue
-
-            # bbox
-            bbox = None
-            if hasattr(trk, "to_ltrb"):
-                bbox = trk.to_ltrb()
-            elif hasattr(trk, "to_tlbr"):
-                bbox = trk.to_tlbr()
-
-            if bbox is None:
-                continue
-
-            x1, y1, x2, y2 = bbox
-
-            # class name (this is the common reason it becomes useless)
-            cls = getattr(trk, "det_class", None)
-            if cls is None and hasattr(trk, "get_det_class"):
-                cls = trk.get_det_class()
-
-            # If track doesn't have class_name, we skip it and fallback to detections below
-            if cls is None:
-                continue
-
-            conf = getattr(trk, "det_conf", 1.0)
-
-            tracked_objects.append({
-                "track_id": int(tid),
-                "class_name": str(cls),
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "confidence": float(conf),
-            })
-
-    # ---- B) Fallback: build from detections (works if you already attached track_id) ----
-    if not tracked_objects and detections:
-        for d in detections:
-            tid = d.get("track_id", None)
-            bbox = d.get("bbox", None)
-            cls = d.get("class_name", None) or d.get("cls_name", None)
-
-            if tid is None or bbox is None or cls is None:
-                continue
-
-            tracked_objects.append({
-                "track_id": int(tid),
-                "class_name": str(cls),
-                "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
-                "confidence": float(d.get("conf", d.get("confidence", 1.0))),
-            })
-
-    return tracked_objects
-
 # ---------------------------------------------------------
 #  Base Preprocessor
 # ---------------------------------------------------------
@@ -1969,27 +1850,6 @@ class FisheyePreprocessor:
 
         return True
     
-    def reload_view_configs(self, new_view_configs):
-        """
-        Runtime reload for dashboard/live pipeline.
-        Replaces view_configs and rebuilds remap maps immediately.
-        """
-        try:
-            with self._lock:
-                self.view_configs = [dict(v) for v in (new_view_configs or []) if isinstance(v, dict)]
-                if not self.view_configs:
-                    return False
-
-                # keep ROI polygons fresh too
-                self._load_config()
-
-                # CRITICAL: rebuild remap maps
-                self._build_all_maps()
-
-        except Exception as e:
-            if self.logger:
-                self.logger.warning(f"[FisheyePreprocessor] runtime reload failed: {e}")
-            return False
 # ---------------------------------------------------------
 #  Create Preprocessor
 # ---------------------------------------------------------
