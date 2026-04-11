@@ -171,19 +171,6 @@ def _ensure_roi_file(mode: str, id_: str) -> Path:
         )
     return roi_path
 
-def _mirror_live_event_log(cam_id: str, pipeline, stop_flag: threading.Event):
-    target = LIVE_ROOT / cam_id
-    target.mkdir(parents=True, exist_ok=True)
-    while not stop_flag.is_set():
-        try:
-            src = Path(pipeline.event_log_path)
-            dst = target / "event_log.jsonl"
-            if src.exists():
-                dst.write_bytes(src.read_bytes())
-        except Exception:
-            pass
-        time.sleep(0.5)
-
 def _reset_live_run_files(cam_id: str) -> None:
     """
     On every backend restart, we want LIVE detection to start fresh:
@@ -3128,135 +3115,6 @@ async def lifespan(app: FastAPI):
 
     # ✅ SHUTDOWN
     _system("Shutdown: backend stopping")
-
-
-# =========================================================
-# Stability / Watchdog / Auto-Restart
-# =========================================================
-
-AUTO_RESTART_ENABLED = True
-AUTO_RESTART_SECONDS = 7200  # 2 hours, change if needed
-
-WATCHDOG_ENABLED = True
-WATCHDOG_CHECK_SEC = 5
-LIVE_STALE_SEC = 20
-
-_bg_threads = {}
-_bg_threads_lock = threading.Lock()
-
-_live_last_ok_ts = {}
-_live_last_ok_lock = threading.Lock()
-
-_backend_started_at = time.time()
-
-
-def _register_bg_thread(name: str, th: threading.Thread):
-    with _bg_threads_lock:
-        _bg_threads[name] = th
-
-
-def _start_bg_thread(name: str, target, *args, **kwargs):
-    th = threading.Thread(
-        target=target,
-        args=args,
-        kwargs=kwargs,
-        daemon=True,
-        name=name,
-    )
-    th.start()
-    _register_bg_thread(name, th)
-    try:
-        _system(f"THREAD STARTED: {name}")
-    except Exception:
-        print(f"[SYSTEM] THREAD STARTED: {name}")
-    return th
-
-
-def _touch_live_ok(cam_id: str):
-    with _live_last_ok_lock:
-        _live_last_ok_ts[str(cam_id)] = time.time()
-
-
-def _get_live_last_ok(cam_id: str) -> float:
-    with _live_last_ok_lock:
-        return float(_live_last_ok_ts.get(str(cam_id), 0.0))
-
-
-def backend_auto_restart_loop():
-    global _backend_started_at
-    try:
-        _system(f"AUTO-RESTART supervisor started (enabled={AUTO_RESTART_ENABLED}, interval={AUTO_RESTART_SECONDS}s)")
-    except Exception:
-        print(
-            f"[SYSTEM] AUTO-RESTART supervisor started (enabled={AUTO_RESTART_ENABLED}, interval={AUTO_RESTART_SECONDS}s)")
-
-    while True:
-        time.sleep(30)
-
-        if not AUTO_RESTART_ENABLED:
-            continue
-
-        elapsed = time.time() - _backend_started_at
-        if elapsed < AUTO_RESTART_SECONDS:
-            continue
-
-        try:
-            _system("AUTO-RESTART: interval reached, restarting backend process...")
-        except Exception:
-            print("[SYSTEM] AUTO-RESTART: interval reached, restarting backend process...")
-
-        try:
-            python = sys.executable
-            os.execv(python, [python] + sys.argv)
-        except Exception as e:
-            try:
-                _system(f"AUTO-RESTART exec failed: {e}")
-            except Exception:
-                print(f"[SYSTEM] AUTO-RESTART exec failed: {e}")
-            os._exit(0)
-
-
-def live_watchdog_loop():
-    try:
-        _system("LIVE watchdog started")
-    except Exception:
-        print("[SYSTEM] LIVE watchdog started")
-
-    watched_names = {
-        "live_pump": globals().get("live_pump"),
-        "live_auto_toggle_fisheye": globals().get("live_auto_toggle_fisheye"),
-        "monitor_live_videos_loop": globals().get("monitor_live_videos_loop"),
-    }
-
-    while True:
-        time.sleep(WATCHDOG_CHECK_SEC)
-
-        if not WATCHDOG_ENABLED:
-            continue
-
-        try:
-            with _bg_threads_lock:
-                snap = dict(_bg_threads)
-
-            for name, target in watched_names.items():
-                if target is None:
-                    continue
-
-                th = snap.get(name)
-                if th is None or (not th.is_alive()):
-                    try:
-                        _system(f"WATCHDOG: thread dead -> restarting {name}")
-                    except Exception:
-                        print(f"[SYSTEM] WATCHDOG: thread dead -> restarting {name}")
-                    _start_bg_thread(name, target)
-
-        except Exception as e:
-            try:
-                _system(f"WATCHDOG ERROR: {e}")
-            except Exception:
-                print(f"[SYSTEM] WATCHDOG ERROR: {e}")
-            traceback.print_exc()
-
 
 # ============================================================
 # FastAPI Application
@@ -8626,4 +8484,3 @@ def set_live_active_sequence(payload: dict = Body(...)):
         "mode": mode,
         "active_cam_ids": cleaned
     }
-
