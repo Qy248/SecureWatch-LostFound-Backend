@@ -391,54 +391,6 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
             out.append(zz)
         return out
 
-    def _filter_one_group(self, dets: list, zones: list, img, conf_min: float, min_area: int):
-        if not dets:
-            return []
-
-        try:
-            dets = lf.filter_detections_by_conf_and_size(
-                dets,
-                conf_min=conf_min,
-                min_area=min_area,
-            )
-        except Exception:
-            pass
-
-        if not dets or not zones:
-            return []
-
-        img_shape = img.shape if isinstance(img, np.ndarray) else None
-        if img_shape is None:
-            return []
-
-        try:
-            dets = lf.filter_detections_to_zones_by_overlap(
-                dets,
-                zones,
-                img_shape=img_shape,
-                min_ratio=0.30,
-            )
-        except Exception:
-            dets = []
-
-        if not dets:
-            return []
-
-        try:
-            dets = lf.filter_detections_to_zones_strict(dets, zones, margin=0)
-        except Exception:
-            pass
-
-        if not dets:
-            return []
-
-        try:
-            dets = lf.dedup_by_overlap_ratio(dets, overlap_thr=0.50)
-        except Exception:
-            pass
-
-        return dets
-
     def _filter_for_tracking(self, img, zones, raw):
         raw = raw or []
         zones = self._normalize_zone_ids_for_pipeline(zones)
@@ -610,32 +562,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 except Exception:
                     pass
         return img
-
-    def _get_fisheye_view_name_by_global_idx(self, view_idx_global: int) -> str:
-        try:
-            vi = int(view_idx_global)
-        except Exception:
-            vi = 0
-
-        gi = 0 if (not self.is_fisheye or vi < 4) else 1
-        local = (vi - 4) if (self.is_fisheye and gi == 1 and vi >= 4) else vi
-        local = max(0, min(3, local))
-
-        names = self._fisheye_expected_names(gi)
-        if 0 <= local < len(names):
-            return names[local]
-        return f"view_{local}"
-
-    def _current_normal_polys(self):
-        cfg = self._get_roi_cfg_cached()
-        return cfg.get("bounding_polygons", []) or []
-
-    def _current_fisheye_polys(self, view_name: str):
-        cfg = self._get_roi_cfg_cached()
-        fish = cfg.get("fisheye_polygons", {}) or {}
-        vals = fish.get(view_name, [])
-        return vals if isinstance(vals, list) else []
-
+        
 class RealtimeFreshRTSPReaderThread(threading.Thread):
     """
     RTSP reader tuned to behave closer to Attire:
