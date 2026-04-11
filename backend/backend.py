@@ -3129,7 +3129,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://qy248.github.io",
         "https://jinxuan-wong.github.io",
-        "https://c9e92d69.securewatch.pages.dev",
+        "https://tarumtfocslab.github.io",
     ],
     allow_credentials=True,
     allow_methods=["*"],
