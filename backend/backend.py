@@ -5503,6 +5503,7 @@ def api_lf_delete_item(item_id: str):
         "deleted": True,
         "status": "deleted",
     }
+    
 
 def _get_lostfound_report_items(request: Request, include_deleted: bool = True):
     base = str(request.base_url).rstrip("/")
