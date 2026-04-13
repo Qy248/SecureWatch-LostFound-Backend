@@ -351,12 +351,13 @@ def _write_roi_config_safe(config_path: str, bounding_polygons: list, fisheye_po
 # ---------------------------------------------------------
 # Output roots
 # ---------------------------------------------------------
-OUTPUT_BASE = "outputs"
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+# IMPORTANT:
+# video_pipeline.py is already inside lostfound_backend,
+# so use MODULE_DIR directly, not its parent.
+OUTPUT_BASE = os.path.join(MODULE_DIR, "outputs")
 LAF_BASE = os.path.join(OUTPUT_BASE, "lost_and_found")
-SNAPSHOT_BASE = "snapshots"
-os.makedirs(LAF_BASE, exist_ok=True)
-os.makedirs(SNAPSHOT_BASE, exist_ok=True)
-
+SNAPSHOT_BASE = os.path.join(MODULE_DIR, "snapshots")
 
 # ---------------------------------------------------------
 # ViewProcessor subclass

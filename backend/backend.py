@@ -720,15 +720,29 @@ def _normalize_lf_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _item_ts_seconds(item: Dict[str, Any]) -> float:
-    for key in ("lastSeenTs", "firstSeenTs", "timestamp", "updatedAt", "createdAt"):
+    """
+    Return a REAL wall-clock timestamp only.
+    Ignore relative video seconds like 100, 451, 917.
+    """
+    MODERN_TS_MIN = 1_700_000_000  # around year 2023+
+
+    for key in ("updatedAt", "createdAt", "timestamp", "lastSeenTs", "firstSeenTs"):
         try:
             val = item.get(key)
-            if val is not None:
-                return float(val)
-        except Exception:
-            pass
-    return 0.0
+            if val is None:
+                continue
 
+            ts = float(val)
+
+            # Ignore relative/video timeline values
+            if ts < MODERN_TS_MIN:
+                continue
+
+            return ts
+        except Exception:
+            continue
+
+    return 0.0
 
 def _prune_json_store_shards(root: Path, prefix: str, cutoff_ts: float, per_file: int) -> int:
     data = _lf_load_all_shards(root, prefix)
@@ -744,7 +758,14 @@ def _prune_json_store_shards(root: Path, prefix: str, cutoff_ts: float, per_file
             continue
 
         ts = _item_ts_seconds(value)
-        if ts > 0 and ts < cutoff_ts:
+
+        # IMPORTANT:
+        # if no valid wall-clock timestamp, keep it
+        if ts <= 0:
+            kept[key] = value
+            continue
+
+        if ts < cutoff_ts:
             continue
 
         kept[key] = value
@@ -4718,64 +4739,71 @@ def _pick_status(obj: dict) -> str:
 def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
     it = it or {}
     raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
+    raw = dict(raw or {})  # editable copy
 
     snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
     snap_str = str(snap or "").strip()
 
-    raw_id = str(it.get("id") or it.get("item_id") or "").strip()
+    resolved_name = _resolve_item_location(cam_id)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(resolved_name or cam_id)).strip("_")
+
+    raw_id = str(
+        raw.get("lost_id")
+        or it.get("id")
+        or it.get("item_id")
+        or ""
+    ).strip()
+
+    # remove default prefix like B001GB_, keep ROI1_...
+    if "_ROI" in raw_id:
+        raw_id = "ROI" + raw_id.split("_ROI", 1)[1]
+
+    # write cleaned value back into raw too
+    raw["lost_id"] = raw_id
+
+    cam_id_clean = str(cam_id or "").strip()
 
     if raw_id:
-        item_id = f"live-{cam_id}-{raw_id}"
+        item_id = f"live-{cam_id_clean}_{safe_name}_{raw_id}"
     elif snap_str:
         snap_name = Path(snap_str).name
-        item_id = f"live-{cam_id}-{snap_name}"
+        item_id = f"live-{cam_id_clean}_{safe_name}_{snap_name}"
     else:
-        item_id = f"live-{cam_id}-{abs(hash(str(it)))}"
+        item_id = f"live-{cam_id_clean}_{safe_name}_{int(time.time() * 1000)}"
 
     image_url = to_image_url(snap, request_base)
 
-    # --- Extract times ---
     try:
         lost_time = float(raw.get("lost_time")) if raw.get("lost_time") is not None else None
     except Exception:
         lost_time = None
 
     try:
-        last_attended_time = (
-            float(raw.get("last_attended_time"))
-            if raw.get("last_attended_time") is not None
-            else None
-        )
-    except Exception:
-        last_attended_time = None
-
-    try:
         duration_before_lost = float(raw.get("duration_before_lost") or 0)
     except Exception:
         duration_before_lost = 0.0
 
-    # --- lastSeenTs (BEST: use lost_time) ---
+    # lastSeenTs = lost event time if available
     if lost_time is not None:
-        last_seen_ts = float(lost_time)
+        last_seen_ts = int(lost_time)
     else:
-        ts_guess = _ts_from_snapshot_name(str(snap)) if snap else 0
+        ts_guess = _ts_from_snapshot_name(snap_str) if snap_str else 0
         try:
-            last_seen_ts = float(ts_guess) if float(ts_guess) > 0 else float(time.time())
+            last_seen_ts = int(ts_guess) if int(ts_guess) > 0 else int(time.time())
         except Exception:
-            last_seen_ts = float(time.time())
+            last_seen_ts = int(time.time())
 
-    # --- firstSeenTs (BEST: use last_attended_time) ---
-    if last_attended_time is not None:
-        first_seen_ts = float(last_attended_time)
-    else:
-        duration_sec = max(0.0, duration_before_lost)
-        first_seen_ts = float(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
+    # IMPORTANT:
+    # firstSeenTs should follow backend original logic:
+    # duration_before_lost = lost_time - first_seen_time
+    duration_sec = max(0.0, duration_before_lost)
+    first_seen_ts = int(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
 
-    # safety check
+    # safety
     if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
         first_seen_ts = last_seen_ts
 
-    location = extract_location_from_stem(cam_id)
+    location = resolved_name
 
     return {
         "id": item_id,
@@ -4788,75 +4816,77 @@ def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
         "firstSeenTs": first_seen_ts,
         "lastSeenTs": last_seen_ts,
         "imageUrl": image_url,
-        "raw": it,
+        "raw": raw,
     }
-
 
 def _normalize_offline_item(stem: str, it: dict, request_base: str) -> dict:
     it = it or {}
     raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
+    raw = dict(raw or {})  # editable copy
+
+    snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+    snap_str = str(snap or "").strip()
+
+    resolved_name = _resolve_item_location(stem)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(resolved_name or stem)).strip("_")
 
     lost_id = raw.get("lost_id") or it.get("lost_id") or it.get("id") or it.get("item_id")
     lost_id = str(lost_id or "").strip()
 
-    if lost_id:
-        item_id = f"offline-{stem}-{lost_id}"
-    else:
-        snap0 = str(it.get("image_path") or it.get("snapshot_path") or "")
-        item_id = f"offline-{stem}-{abs(hash(snap0))}"
+    # remove default prefix like B001GB_, keep ROI1_...
+    if "_ROI" in lost_id:
+        lost_id = "ROI" + lost_id.split("_ROI", 1)[1]
 
-    snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+    # write cleaned value back into raw too
+    raw["lost_id"] = lost_id
+
+    stem_clean = str(stem or "").strip()
+
+    if lost_id:
+        item_id = f"offline-{stem_clean}_{safe_name}_{lost_id}"
+    elif snap_str:
+        item_id = f"offline-{stem_clean}_{safe_name}_{Path(snap_str).name}"
+    else:
+        item_id = f"offline-{stem_clean}_{safe_name}_{int(time.time() * 1000)}"
+
     image_url = to_image_url(snap, request_base)
 
-    # --- Extract times ---
     try:
         lost_time = float(raw.get("lost_time")) if raw.get("lost_time") is not None else None
     except Exception:
         lost_time = None
 
     try:
-        last_attended_time = (
-            float(raw.get("last_attended_time"))
-            if raw.get("last_attended_time") is not None
-            else None
-        )
-    except Exception:
-        last_attended_time = None
-
-    try:
         duration_before_lost = float(raw.get("duration_before_lost") or 0)
     except Exception:
         duration_before_lost = 0.0
 
-    # --- lastSeenTs ---
+    # lastSeenTs = lost event time if available
     if lost_time is not None:
-        last_seen_ts = float(lost_time)
+        last_seen_ts = int(lost_time)
     else:
-        ts_guess = _ts_from_snapshot_name(str(snap)) if snap else 0
+        ts_guess = _ts_from_snapshot_name(snap_str) if snap_str else 0
         try:
-            last_seen_ts = float(ts_guess) if float(ts_guess) > 0 else float(time.time())
+            last_seen_ts = int(ts_guess) if int(ts_guess) > 0 else int(time.time())
         except Exception:
-            last_seen_ts = float(time.time())
+            last_seen_ts = int(time.time())
 
-    # --- firstSeenTs ---
-    if last_attended_time is not None:
-        first_seen_ts = float(last_attended_time)
-    else:
-        duration_sec = max(0.0, duration_before_lost)
-        first_seen_ts = float(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
+    # IMPORTANT:
+    # firstSeenTs should follow backend original logic:
+    # duration_before_lost = lost_time - first_seen_time
+    duration_sec = max(0.0, duration_before_lost)
+    first_seen_ts = int(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
 
-    # safety check
+    # safety
     if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
         first_seen_ts = last_seen_ts
-
-    location = extract_location_from_stem(stem)
 
     return {
         "id": item_id,
         "module": "lost_found",
         "source": "upload",
         "videoId": stem,
-        "location": location,
+        "location": resolved_name,
         "label": _pick_label(it).replace("_", " ").title(),
         "status": _pick_status(it),
         "firstSeenTs": first_seen_ts,
@@ -4864,6 +4894,7 @@ def _normalize_offline_item(stem: str, it: dict, request_base: str) -> dict:
         "imageUrl": image_url,
         "raw": raw,
     }
+
 
 def _read_json_file(p: Path) -> dict:
     try:
@@ -8485,3 +8516,4 @@ def set_live_active_sequence(payload: dict = Body(...)):
         "mode": mode,
         "active_cam_ids": cleaned
     }
+
